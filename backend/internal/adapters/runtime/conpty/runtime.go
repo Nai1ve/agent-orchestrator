@@ -484,10 +484,19 @@ const (
 // not exit evidence: a healthy supervisor has no child until child.Start, so
 // exit is concluded only after this launch's agent was observed. A failed
 // process-table read is returned as an error.
+//
+// Concurrent probes may finish out of order, so absence is judged only against
+// an observation recorded before this probe's snapshot began. That earlier
+// snapshot showed the agent, so the agent started before this snapshot and its
+// absence here is an exit. An observation recorded while this snapshot was in
+// flight could postdate it and proves nothing about it.
 func (r *Runtime) supervisedWorkload(ctx context.Context, sess *hostSession, supervisorPID int) (supervisedWorkloadState, error) {
 	if supervisorPID <= 0 {
 		return workloadUnconfirmed, fmt.Errorf("conpty: supervisor pid unavailable: %w", ports.ErrRuntimeProbeInconclusive)
 	}
+	r.mu.Lock()
+	observedBeforeSnapshot := sess.agentObserved
+	r.mu.Unlock()
 	table, err := r.processTable(ctx)
 	if err != nil {
 		return workloadUnconfirmed, fmt.Errorf("conpty: inspect supervisor %d: %w", supervisorPID, errors.Join(ports.ErrRuntimeProbeInconclusive, err))
@@ -500,7 +509,7 @@ func (r *Runtime) supervisedWorkload(ctx context.Context, sess *hostSession, sup
 	case hasChild:
 		sess.agentObserved = true
 		return workloadRunning, nil
-	case sess.agentObserved:
+	case observedBeforeSnapshot:
 		return workloadExited, nil
 	default:
 		return workloadUnconfirmed, nil
