@@ -53,10 +53,14 @@ var validSessionID = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // hostSession is the in-memory state for a live pty-host connection.
 type hostSession struct {
-	addr             string
-	pid              int
-	launchID         string
-	supervised       bool
+	addr       string
+	pid        int
+	launchID   string
+	supervised bool
+	// agentObserved records that this launch's supervisor was seen owning its
+	// managed agent. Guarded by Runtime.mu. In memory only: after a daemon
+	// restart an unobserved supervisor without a child stays unconfirmed.
+	agentObserved    bool
 	currentOwner     bool
 	protocolVersion  int
 	protocolResolved bool
@@ -449,31 +453,58 @@ func (r *Runtime) ProbeFencedRuntime(ctx context.Context, ref ports.FencedRuntim
 		return ports.FencedProbeResult{Liveness: ports.FencedDead, Reason: ports.FencedReasonExactAbsent}
 	}
 	if sess.supervised {
-		workloadAlive, err := r.supervisorOwnsChild(ctx, status.PID)
-		if err != nil {
+		workload, err := r.supervisedWorkload(ctx, sess, status.PID)
+		switch {
+		case err != nil:
 			return ports.FencedProbeResult{Liveness: ports.FencedUnknown, Reason: ports.FencedReasonProbeFailed}
-		}
-		if !workloadAlive {
+		case workload == workloadUnconfirmed:
+			return ports.FencedProbeResult{Liveness: ports.FencedUnknown, Reason: ports.FencedReasonWorkloadUnconfirmed}
+		case workload == workloadExited:
 			return ports.FencedProbeResult{Liveness: ports.FencedDead, Reason: ports.FencedReasonExactAbsent}
 		}
 	}
 	return ports.FencedProbeResult{Liveness: ports.FencedAlive, Reason: ports.FencedReasonExactMatch}
 }
 
-// supervisorOwnsChild reports whether the AO supervisor running as the host's
-// direct child still has its managed agent. After that agent exits the
-// supervisor stays alive only to report the exit, which is not proof that an
-// agent can receive input. A failed process-table read is returned as an error.
-func (r *Runtime) supervisorOwnsChild(ctx context.Context, supervisorPID int) (bool, error) {
+// supervisedWorkloadState classifies the managed agent of a live AO supervisor.
+type supervisedWorkloadState int
+
+const (
+	// workloadUnconfirmed: the supervisor has no child and none was ever seen
+	// for this launch. It may not have started its agent yet.
+	workloadUnconfirmed supervisedWorkloadState = iota
+	// workloadRunning: the supervisor currently owns its agent.
+	workloadRunning
+	// workloadExited: the agent was seen and is gone. The supervisor runs
+	// exactly one agent, so it is now only reporting that agent's exit.
+	workloadExited
+)
+
+// supervisedWorkload inspects the supervisor's descendants. Absence alone is
+// not exit evidence: a healthy supervisor has no child until child.Start, so
+// exit is concluded only after this launch's agent was observed. A failed
+// process-table read is returned as an error.
+func (r *Runtime) supervisedWorkload(ctx context.Context, sess *hostSession, supervisorPID int) (supervisedWorkloadState, error) {
 	if supervisorPID <= 0 {
-		return false, fmt.Errorf("conpty: supervisor pid unavailable: %w", ports.ErrRuntimeProbeInconclusive)
+		return workloadUnconfirmed, fmt.Errorf("conpty: supervisor pid unavailable: %w", ports.ErrRuntimeProbeInconclusive)
 	}
 	table, err := r.processTable(ctx)
 	if err != nil {
-		return false, fmt.Errorf("conpty: inspect supervisor %d: %w", supervisorPID, errors.Join(ports.ErrRuntimeProbeInconclusive, err))
+		return workloadUnconfirmed, fmt.Errorf("conpty: inspect supervisor %d: %w", supervisorPID, errors.Join(ports.ErrRuntimeProbeInconclusive, err))
 	}
 	// Tree includes the supervisor itself; any further process is its agent.
-	return len(table.Tree(supervisorPID).Processes) > 1, nil
+	hasChild := len(table.Tree(supervisorPID).Processes) > 1
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch {
+	case hasChild:
+		sess.agentObserved = true
+		return workloadRunning, nil
+	case sess.agentObserved:
+		return workloadExited, nil
+	default:
+		return workloadUnconfirmed, nil
+	}
 }
 
 // supervisedLaunch recognizes the AO supervisor wrapper that Session Manager
@@ -514,7 +545,8 @@ func (r *Runtime) IsSupervisedProcessAlive(ctx context.Context, handle ports.Run
 // IsExactSupervisedProcessAlive fences the host's one child by the exact
 // launch id, like IsSupervisedProcessAlive. Unlike that reaper probe, a
 // supervised launch counts only while the supervisor still owns its managed
-// agent: a supervisor reporting its child's exit is not a live agent.
+// agent: a supervisor reporting its child's exit is not a live agent, and a
+// supervisor that has not yet started its agent is inconclusive, not dead.
 func (r *Runtime) IsExactSupervisedProcessAlive(ctx context.Context, handle ports.RuntimeHandle, ref ports.SupervisedProcessRef) (bool, error) {
 	if ref.SessionID == "" || ref.LaunchID == "" {
 		return false, errors.New("conpty: exact supervisor session and launch are required")
@@ -536,7 +568,14 @@ func (r *Runtime) IsExactSupervisedProcessAlive(ctx context.Context, handle port
 	if !sess.supervised {
 		return true, nil
 	}
-	return r.supervisorOwnsChild(ctx, status.PID)
+	workload, err := r.supervisedWorkload(ctx, sess, status.PID)
+	if err != nil {
+		return false, err
+	}
+	if workload == workloadUnconfirmed {
+		return false, fmt.Errorf("conpty: supervisor for %q has not started its agent: %w", handle.ID, ports.ErrRuntimeProbeInconclusive)
+	}
+	return workload == workloadRunning, nil
 }
 
 // ProcessRootPIDs returns the PTY host pid so memory accounting can walk the
