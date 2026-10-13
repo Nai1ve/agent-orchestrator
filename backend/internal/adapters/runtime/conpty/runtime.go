@@ -14,6 +14,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/conpty/ptyregistry"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/procmem"
 )
 
 const (
@@ -55,6 +56,7 @@ type hostSession struct {
 	addr             string
 	pid              int
 	launchID         string
+	supervised       bool
 	currentOwner     bool
 	protocolVersion  int
 	protocolResolved bool
@@ -89,6 +91,7 @@ type Runtime struct {
 	unregisterHost func(context.Context, string) error
 	destroyWait    time.Duration
 	destroyPoll    time.Duration
+	processTable   func(context.Context) (*procmem.Table, error)
 
 	mu       sync.Mutex
 	sessions map[string]*hostSession // sessionID -> live session
@@ -114,6 +117,7 @@ func New(opts Options) *Runtime {
 		unregisterHost: unregisterHost,
 		destroyWait:    500 * time.Millisecond,
 		destroyPoll:    25 * time.Millisecond,
+		processTable:   func(ctx context.Context) (*procmem.Table, error) { return procmem.Snapshot(ctx, nil) },
 		sessions:       make(map[string]*hostSession),
 	}
 }
@@ -156,14 +160,15 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 	// If the daemon crashes after the child starts but before its PID/address
 	// update is durable, a fresh daemon must still see unknown ownership rather
 	// than exact absence.
+	supervised := supervisedLaunch(cfg.Argv)
 	reservation := &hostSession{
-		addr: unresolvedHostAddress, launchID: cfg.Env[runtimeLaunchIDEnv], currentOwner: true,
+		addr: unresolvedHostAddress, launchID: cfg.Env[runtimeLaunchIDEnv], supervised: supervised, currentOwner: true,
 	}
 	r.sessions[id] = reservation
 	r.mu.Unlock()
 	if err := r.registerHost(ctx, ptyregistry.Entry{
 		SessionID: id, PtyHostPID: 0, PipePath: unresolvedHostAddress,
-		LaunchID: reservation.launchID, RegisteredAt: time.Now().UTC().Format(time.RFC3339),
+		LaunchID: reservation.launchID, Supervised: supervised, RegisteredAt: time.Now().UTC().Format(time.RFC3339),
 	}); err != nil {
 		r.mu.Lock()
 		delete(r.sessions, id)
@@ -194,13 +199,13 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 			// spawner could not prove cleanup. Retain its PID and launch fence in
 			// both memory and the restart registry. The sentinel address prevents
 			// ordinary client traffic while keeping the possible handle probeable.
-			sess := &hostSession{addr: unresolvedHostAddress, pid: pid, launchID: cfg.Env[runtimeLaunchIDEnv], currentOwner: true}
+			sess := &hostSession{addr: unresolvedHostAddress, pid: pid, launchID: cfg.Env[runtimeLaunchIDEnv], supervised: supervised, currentOwner: true}
 			r.mu.Lock()
 			r.sessions[id] = sess
 			r.mu.Unlock()
 			registryErr := r.registerHost(ctx, ptyregistry.Entry{
 				SessionID: id, PtyHostPID: pid, PipePath: unresolvedHostAddress,
-				LaunchID: sess.launchID, RegisteredAt: time.Now().UTC().Format(time.RFC3339),
+				LaunchID: sess.launchID, Supervised: supervised, RegisteredAt: time.Now().UTC().Format(time.RFC3339),
 			})
 			if registryErr != nil {
 				cause = errors.Join(cause, fmt.Errorf("retain unresolved pty-host ownership for %q: %w", id, registryErr))
@@ -214,7 +219,7 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 			return ports.RuntimeHandle{}, conptyPartialCreateFailure(cause, handle, ports.RuntimeCleanupFailed)
 		}
 		r.mu.Lock()
-		r.sessions[id] = &hostSession{addr: addr, pid: pid, launchID: cfg.Env[runtimeLaunchIDEnv], currentOwner: true}
+		r.sessions[id] = &hostSession{addr: addr, pid: pid, launchID: cfg.Env[runtimeLaunchIDEnv], supervised: supervised, currentOwner: true}
 		r.mu.Unlock()
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 		cleanupErr := r.Destroy(cleanupCtx, handle)
@@ -226,7 +231,7 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 	}
 
 	sess := &hostSession{
-		addr: addr, pid: pid, launchID: cfg.Env[runtimeLaunchIDEnv], currentOwner: true,
+		addr: addr, pid: pid, launchID: cfg.Env[runtimeLaunchIDEnv], supervised: supervised, currentOwner: true,
 		protocolVersion: conPTYHostProtocolVersion, protocolResolved: true,
 	}
 
@@ -239,6 +244,7 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 		PtyHostPID:   pid,
 		PipePath:     addr, // ponytail: reuse PipePath field for loopback addr
 		LaunchID:     sess.launchID,
+		Supervised:   sess.supervised,
 		RegisteredAt: time.Now().UTC().Format(time.RFC3339),
 	}); err != nil {
 		handle := ports.RuntimeHandle{ID: id}
@@ -439,10 +445,42 @@ func (r *Runtime) ProbeFencedRuntime(ctx context.Context, ref ports.FencedRuntim
 	if err != nil || !hostAlive {
 		return ports.FencedProbeResult{Liveness: ports.FencedUnknown, Reason: ports.FencedReasonProbeFailed}
 	}
-	if status.Alive {
-		return ports.FencedProbeResult{Liveness: ports.FencedAlive, Reason: ports.FencedReasonExactMatch}
+	if !status.Alive {
+		return ports.FencedProbeResult{Liveness: ports.FencedDead, Reason: ports.FencedReasonExactAbsent}
 	}
-	return ports.FencedProbeResult{Liveness: ports.FencedDead, Reason: ports.FencedReasonExactAbsent}
+	if sess.supervised {
+		workloadAlive, err := r.supervisorOwnsChild(ctx, status.PID)
+		if err != nil {
+			return ports.FencedProbeResult{Liveness: ports.FencedUnknown, Reason: ports.FencedReasonProbeFailed}
+		}
+		if !workloadAlive {
+			return ports.FencedProbeResult{Liveness: ports.FencedDead, Reason: ports.FencedReasonExactAbsent}
+		}
+	}
+	return ports.FencedProbeResult{Liveness: ports.FencedAlive, Reason: ports.FencedReasonExactMatch}
+}
+
+// supervisorOwnsChild reports whether the AO supervisor running as the host's
+// direct child still has its managed agent. After that agent exits the
+// supervisor stays alive only to report the exit, which is not proof that an
+// agent can receive input. A failed process-table read is returned as an error.
+func (r *Runtime) supervisorOwnsChild(ctx context.Context, supervisorPID int) (bool, error) {
+	if supervisorPID <= 0 {
+		return false, fmt.Errorf("conpty: supervisor pid unavailable: %w", ports.ErrRuntimeProbeInconclusive)
+	}
+	table, err := r.processTable(ctx)
+	if err != nil {
+		return false, fmt.Errorf("conpty: inspect supervisor %d: %w", supervisorPID, errors.Join(ports.ErrRuntimeProbeInconclusive, err))
+	}
+	// Tree includes the supervisor itself; any further process is its agent.
+	return len(table.Tree(supervisorPID).Processes) > 1, nil
+}
+
+// supervisedLaunch recognizes the AO supervisor wrapper that Session Manager
+// prepends to managed agent argv.
+func supervisedLaunch(argv []string) bool {
+	_, argv = stripEnvAssignments(argv)
+	return len(argv) > 2 && argv[1] == "agent-process" && argv[2] == "supervise"
 }
 
 // IsSupervisedProcessAlive uses the pty-host's child status. For a supervised
@@ -473,13 +511,32 @@ func (r *Runtime) IsSupervisedProcessAlive(ctx context.Context, handle ports.Run
 	return status.Alive, nil
 }
 
-// IsExactSupervisedProcessAlive has the same implementation on ConPTY because
-// the pty-host registry already fences its one child by the exact launch id.
+// IsExactSupervisedProcessAlive fences the host's one child by the exact
+// launch id, like IsSupervisedProcessAlive. Unlike that reaper probe, a
+// supervised launch counts only while the supervisor still owns its managed
+// agent: a supervisor reporting its child's exit is not a live agent.
 func (r *Runtime) IsExactSupervisedProcessAlive(ctx context.Context, handle ports.RuntimeHandle, ref ports.SupervisedProcessRef) (bool, error) {
 	if ref.SessionID == "" || ref.LaunchID == "" {
 		return false, errors.New("conpty: exact supervisor session and launch are required")
 	}
-	return r.IsSupervisedProcessAlive(ctx, handle, ref)
+	sess, err := r.resolveWithEvidence(ctx, handle.ID)
+	if err != nil {
+		return false, fmt.Errorf("conpty: resolve supervised runtime %q: %w", handle.ID, err)
+	}
+	if sess == nil || string(ref.SessionID) != handle.ID || sess.launchID == "" || sess.launchID != ref.LaunchID {
+		return false, nil
+	}
+	status, hostAlive, err := clientStatusContext(ctx, sess.addr)
+	if err != nil {
+		return false, err
+	}
+	if !hostAlive || !status.Alive {
+		return false, nil
+	}
+	if !sess.supervised {
+		return true, nil
+	}
+	return r.supervisorOwnsChild(ctx, status.PID)
 }
 
 // ProcessRootPIDs returns the PTY host pid so memory accounting can walk the
@@ -654,7 +711,7 @@ func (r *Runtime) resolveWithEvidence(ctx context.Context, id string) (*hostSess
 			continue
 		}
 		// Re-populate the map so subsequent calls skip the file scan.
-		recovered := &hostSession{addr: e.PipePath, pid: e.PtyHostPID, launchID: e.LaunchID}
+		recovered := &hostSession{addr: e.PipePath, pid: e.PtyHostPID, launchID: e.LaunchID, supervised: e.Supervised}
 		r.mu.Lock()
 		// Only store if another goroutine hasn't beaten us.
 		if r.sessions[id] == nil {

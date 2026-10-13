@@ -10475,7 +10475,7 @@ func TestSend_PaneFallbackCannotPairLostPromptHookWithPriorTrustedAssistant(t *t
 
 	lcm := lifecycle.New(st, nil)
 	manager := New(Deps{
-		Runtime: &fakeRuntime{}, Agents: singleAgent{agent: fakeAgent{}}, Workspace: &fakeWorkspace{},
+		Runtime: &fakeRuntime{aliveByHandle: map[string]bool{"runtime-1": true}}, Agents: singleAgent{agent: fakeAgent{}}, Workspace: &fakeWorkspace{},
 		Store: st, Messenger: &fakeMessenger{}, Lifecycle: lcm,
 	})
 	if err := manager.SendWithOptions(ctx, created.ID, "new prompt whose UserPromptSubmit hook is lost", nil, ports.MessageDeliveryOptions{AuthoredByUser: true}); err != nil {
@@ -10727,7 +10727,7 @@ func TestSend_PaneFallbackWinsAgainstStaleLifecycleProjection(t *testing.T) {
 
 	lcm := lifecycle.New(st, nil)
 	manager := New(Deps{
-		Runtime: &fakeRuntime{}, Agents: singleAgent{agent: fakeAgent{}}, Workspace: &fakeWorkspace{},
+		Runtime: &fakeRuntime{aliveByHandle: map[string]bool{"runtime-1": true}}, Agents: singleAgent{agent: fakeAgent{}}, Workspace: &fakeWorkspace{},
 		Store: st, Messenger: &fakeMessenger{}, Lifecycle: lcm,
 	})
 	hookDone := make(chan error, 1)
