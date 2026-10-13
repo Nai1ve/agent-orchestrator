@@ -5,6 +5,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
+	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
@@ -242,130 +244,175 @@ func TestNativeSendToExitedAgentReturnsAgentExited(t *testing.T) {
 
 const t03PRURL = "https://github.com/o/r/pull/7"
 
-func (f *nativeDeliveryFixture) writeFailingPRWithReviewComment(t *testing.T) ports.SCMObservation {
+func (f *nativeDeliveryFixture) writeFeedbackPR(t *testing.T, failingCI, reviewComment bool) ports.SCMObservation {
 	t.Helper()
-	ctx := context.Background()
-	if err := f.store.WriteSCMObservation(ctx, domain.PullRequest{
+	var comments []domain.PullRequestComment
+	if reviewComment {
+		comments = []domain.PullRequestComment{{
+			ID: "rc-1", Author: "reviewer", File: "main.go", Line: 42, Body: "handle the nil pointer",
+			CreatedAt: time.Now().UTC(), AutoInjectReview: true,
+		}}
+	}
+	if err := f.store.WriteSCMObservation(context.Background(), domain.PullRequest{
 		URL: t03PRURL, SessionID: f.id, Number: 7, HeadSHA: "c1", UpdatedAt: time.Now(), AutoInjectCI: true,
-	}, nil, nil, nil, []domain.PullRequestComment{{
-		ID: "rc-1", Author: "reviewer", File: "main.go", Line: 42, Body: "handle the nil pointer",
-		CreatedAt: time.Now().UTC(), AutoInjectReview: true,
-	}}, ports.ReviewWriteReplace); err != nil {
+	}, nil, nil, nil, comments, ports.ReviewWriteReplace); err != nil {
 		t.Fatalf("persist PR: %v", err)
 	}
-	return ports.SCMObservation{
-		Fetched: true,
-		PR:      ports.SCMPRObservation{URL: t03PRURL, Number: 7, HeadSHA: "c1"},
-		CI: ports.SCMCIObservation{
+	obs := ports.SCMObservation{Fetched: true, PR: ports.SCMPRObservation{URL: t03PRURL, Number: 7, HeadSHA: "c1"}}
+	if failingCI {
+		obs.CI = ports.SCMCIObservation{
 			Summary: string(domain.CIFailing), HeadSHA: "c1",
 			FailedChecks: []ports.SCMCheckObservation{{Name: "build", Status: string(domain.PRCheckFailed), LogTail: "boom"}},
-		},
+		}
 	}
+	return obs
 }
 
-func (f *nativeDeliveryFixture) dedupState(t *testing.T) map[string]string {
+type reactionDedup struct {
+	Seen     map[string]string `json:"seen"`
+	Attempts map[string]int    `json:"attempts"`
+}
+
+func (f *nativeDeliveryFixture) dedup(t *testing.T) (reactionDedup, string) {
 	t.Helper()
 	raw, err := f.store.GetPRLastNudgeSignature(context.Background(), t03PRURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var payload struct {
-		Seen map[string]string `json:"seen"`
-	}
+	var payload reactionDedup
 	if raw != "" {
 		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
 			t.Fatalf("decode dedup %q: %v", raw, err)
 		}
 	}
-	return payload.Seen
+	return payload, raw
 }
 
-const historicalDedup = `{"seen":{"merge-conflict:https://github.com/o/r/pull/7":"conflicting"},"attempts":{"merge-conflict:https://github.com/o/r/pull/7":1}}`
+const (
+	ciKey           = "ci:" + t03PRURL
+	reviewKey       = "comment:" + t03PRURL + ":rc-1"
+	unrelatedKey    = "merge-conflict:" + t03PRURL
+	historicalDedup = `{"seen":{"ci:https://github.com/o/r/pull/7":"an earlier CI failure","comment:https://github.com/o/r/pull/7:rc-1":"an earlier revision of rc-1","merge-conflict:https://github.com/o/r/pull/7":"conflicting"},"attempts":{"ci:https://github.com/o/r/pull/7":1,"comment:https://github.com/o/r/pull/7:rc-1":1,"merge-conflict:https://github.com/o/r/pull/7":1}}`
+)
 
-// T03: review and CI feedback dispatched through the daemon wiring to an
-// exited agent must not consume successful-delivery dedup state.
+// T03: CI and review feedback dispatched through the daemon wiring to an
+// exited agent fail, and neither consumes durable success signatures nor
+// attempt counts, for the target keys or unrelated history. The CI-only and
+// review-only cases each exercise their own rejection: with both present,
+// lifecycle sends CI first and stops at its error.
 // T04: once a new launch is live, the same observation is delivered exactly
 // once, including after lifecycle is rebuilt from the same database.
 func TestNativeFeedbackToExitedAgentStaysUndelivered(t *testing.T) {
-	f := newNativeDeliveryFixture(t)
-	ctx := context.Background()
-	f.launch(t, "launch-a")
-	obs := f.writeFailingPRWithReviewComment(t)
-	if err := f.store.UpdatePRLastNudgeSignature(ctx, t03PRURL, historicalDedup); err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name               string
+		failingCI, comment bool
+		// rejected names the nudge whose rejection this case exercises.
+		rejected  string
+		delivered []string
+	}{
+		{name: "ci only", failingCI: true, rejected: ciKey, delivered: []string{ciKey}},
+		{name: "review only", comment: true, rejected: reviewKey, delivered: []string{reviewKey}},
+		{name: "ci and review", failingCI: true, comment: true, rejected: ciKey, delivered: []string{ciKey, reviewKey}},
 	}
-	f.exitAgent(t)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newNativeDeliveryFixture(t)
+			ctx := context.Background()
+			f.launch(t, "launch-a")
+			obs := f.writeFeedbackPR(t, tc.failingCI, tc.comment)
+			if err := f.store.UpdatePRLastNudgeSignature(ctx, t03PRURL, historicalDedup); err != nil {
+				t.Fatal(err)
+			}
+			_, seededRaw := f.dedup(t)
+			f.exitAgent(t)
 
-	applyErr := f.lcm.ApplySCMObservation(ctx, f.id, obs)
-	seen := f.dedupState(t)
-	received := readFile(f.inputLog("launch-a"))
-	if strings.Contains(received, "boom") || strings.Contains(received, "handle the nil pointer") {
-		t.Fatalf("an exited agent cannot read feedback; agent log=%q", received)
-	}
-	if _, ok := seen["ci:"+t03PRURL]; ok {
-		t.Fatalf("T03: undelivered CI feedback consumed dedup state (applyErr=%v): %v", applyErr, seen)
-	}
-	for key := range seen {
-		if strings.HasPrefix(key, "comment:") {
-			t.Fatalf("T03: undelivered review feedback consumed dedup state (applyErr=%v): %v", applyErr, seen)
-		}
-	}
-	if applyErr == nil {
-		t.Fatal("T03: feedback rejected for an exited agent must surface an error so the observer retries")
-	}
-	if seen["merge-conflict:"+t03PRURL] != "conflicting" {
-		t.Fatalf("unrelated historical dedup changed: %v", seen)
-	}
-	if rec := f.session(t); rec.IsTerminated {
-		t.Fatalf("feedback rejection terminated the session: %+v", rec)
-	}
+			// The same lifecycle instance fails again on retry: a dedup hit would
+			// return nil without attempting delivery.
+			for attempt := 1; attempt <= 2; attempt++ {
+				err := f.lcm.ApplySCMObservation(ctx, f.id, obs)
+				if _, raw := f.dedup(t); raw != seededRaw {
+					t.Fatalf("T03 %s attempt %d: undelivered feedback changed durable dedup (err=%v):\n got  %s\n want %s", tc.name, attempt, err, raw, seededRaw)
+				}
+				if !errors.Is(err, sessionmanager.ErrAgentExited) {
+					t.Fatalf("T03 %s attempt %d: error = %v, want ErrAgentExited from rejecting %s", tc.name, attempt, err, tc.rejected)
+				}
+			}
+			received := readFile(f.inputLog("launch-a"))
+			if strings.Contains(received, "boom") || strings.Contains(received, "handle the nil pointer") {
+				t.Fatalf("an exited agent cannot read feedback; agent log=%q", received)
+			}
+			if rec := f.session(t); rec.IsTerminated {
+				t.Fatalf("feedback rejection terminated the session: %+v", rec)
+			}
 
-	// T04: recovery to a new launch B. Rebuild lifecycle from the same DB
-	// before the first successful delivery: nothing durable may suppress it.
-	destroyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	if err := f.runtime.Destroy(destroyCtx, ports.RuntimeHandle{ID: string(f.id)}); err != nil {
-		cancel()
-		t.Fatal(err)
-	}
-	cancel()
-	f.launch(t, "launch-b")
-	restarted := newDeliveryLifecycle(f.store, sessionLifecycleMessenger{f.sessMgr}, f.agents)
-	restarted.SetSessionInputLease(f.sessMgr)
-	restarted.SetSessionOperationGate(f.sessMgr)
-	if err := restarted.ApplySCMObservation(ctx, f.id, obs); err != nil {
-		t.Fatalf("T04: first delivery after recovery: %v", err)
-	}
-	waitForFile(t, f.inputLog("launch-b"), "boom")
-	waitForFile(t, f.inputLog("launch-b"), "handle the nil pointer")
-	seen = f.dedupState(t)
-	if _, ok := seen["ci:"+t03PRURL]; !ok {
-		t.Fatalf("T04: delivered CI feedback was not recorded: %v", seen)
-	}
-	if _, ok := seen["comment:"+t03PRURL+":rc-1"]; !ok {
-		t.Fatalf("T04: delivered review feedback was not recorded: %v", seen)
-	}
-	if seen["merge-conflict:"+t03PRURL] != "conflicting" {
-		t.Fatalf("unrelated historical dedup changed: %v", seen)
-	}
-	if err := restarted.ApplySCMObservation(ctx, f.id, obs); err != nil {
-		t.Fatalf("T04: duplicate observation: %v", err)
-	}
-	// A duplicate observation after a second rebuild must stay deduplicated.
-	again := newDeliveryLifecycle(f.store, sessionLifecycleMessenger{f.sessMgr}, f.agents)
-	again.SetSessionInputLease(f.sessMgr)
-	if err := again.ApplySCMObservation(ctx, f.id, obs); err != nil {
-		t.Fatalf("T04: duplicate observation after rebuild: %v", err)
-	}
-	if err := f.sessions.Send(ctx, f.id, "T04 fence", nil); err != nil {
-		t.Fatalf("fence send: %v", err)
-	}
-	waitForFile(t, f.inputLog("launch-b"), "T04 fence")
-	log := readFile(f.inputLog("launch-b"))
-	if n := strings.Count(log, "handle the nil pointer"); n != 1 {
-		t.Fatalf("T04: review feedback delivered %d times, want 1; log=%q", n, log)
-	}
-	if n := strings.Count(log, "boom"); n != 1 {
-		t.Fatalf("T04: CI feedback delivered %d times, want 1; log=%q", n, log)
+			// T04: recovery to a new launch B. Rebuild lifecycle from the same DB
+			// before the first successful delivery: nothing durable may suppress it.
+			destroyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			if err := f.runtime.Destroy(destroyCtx, ports.RuntimeHandle{ID: string(f.id)}); err != nil {
+				cancel()
+				t.Fatal(err)
+			}
+			cancel()
+			f.launch(t, "launch-b")
+			restarted := newDeliveryLifecycle(f.store, sessionLifecycleMessenger{f.sessMgr}, f.agents)
+			restarted.SetSessionInputLease(f.sessMgr)
+			restarted.SetSessionOperationGate(f.sessMgr)
+			if err := restarted.ApplySCMObservation(ctx, f.id, obs); err != nil {
+				t.Fatalf("T04: first delivery after recovery: %v", err)
+			}
+			var seeded reactionDedup
+			if err := json.Unmarshal([]byte(seededRaw), &seeded); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := f.dedup(t)
+			for _, key := range []string{ciKey, reviewKey, unrelatedKey} {
+				wantAttempts, wantSeen, changed := seeded.Attempts[key], seeded.Seen[key], false
+				for _, delivered := range tc.delivered {
+					changed = changed || key == delivered
+				}
+				if changed {
+					wantAttempts++
+					if got.Seen[key] == wantSeen {
+						t.Fatalf("T04: delivered %s kept its earlier signature: %+v", key, got)
+					}
+				} else if got.Seen[key] != wantSeen {
+					t.Fatalf("T04: %s signature changed without delivery: %+v", key, got)
+				}
+				if got.Attempts[key] != wantAttempts {
+					t.Fatalf("T04: %s attempts = %d, want %d (one successful delivery after the rejections): %+v", key, got.Attempts[key], wantAttempts, got)
+				}
+			}
+			if err := restarted.ApplySCMObservation(ctx, f.id, obs); err != nil {
+				t.Fatalf("T04: duplicate observation: %v", err)
+			}
+			// A duplicate observation after a second rebuild must stay deduplicated.
+			again := newDeliveryLifecycle(f.store, sessionLifecycleMessenger{f.sessMgr}, f.agents)
+			again.SetSessionInputLease(f.sessMgr)
+			if err := again.ApplySCMObservation(ctx, f.id, obs); err != nil {
+				t.Fatalf("T04: duplicate observation after rebuild: %v", err)
+			}
+			if err := f.sessions.Send(ctx, f.id, "T04 fence", nil); err != nil {
+				t.Fatalf("fence send: %v", err)
+			}
+			waitForFile(t, f.inputLog("launch-b"), "T04 fence")
+			log := readFile(f.inputLog("launch-b"))
+			wantCI, wantReview := 0, 0
+			if tc.failingCI {
+				wantCI = 1
+			}
+			if tc.comment {
+				wantReview = 1
+			}
+			if n := strings.Count(log, "boom"); n != wantCI {
+				t.Fatalf("T04: CI feedback delivered %d times, want %d; log=%q", n, wantCI, log)
+			}
+			if n := strings.Count(log, "handle the nil pointer"); n != wantReview {
+				t.Fatalf("T04: review feedback delivered %d times, want %d; log=%q", n, wantReview, log)
+			}
+			if after, _ := f.dedup(t); after.Attempts[tc.rejected] != seeded.Attempts[tc.rejected]+1 {
+				t.Fatalf("T04: duplicates changed attempts: %+v", after)
+			}
+		})
 	}
 }
 
