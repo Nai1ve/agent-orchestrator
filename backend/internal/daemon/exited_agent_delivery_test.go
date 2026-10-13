@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -226,7 +227,7 @@ func TestNativeSendToExitedAgentReturnsAgentExited(t *testing.T) {
 		t.Fatalf("T01: send to an exited agent returned success (HTTP 200 ok=true) although the agent never read it; agent log=%q", received)
 	}
 	rr := httptest.NewRecorder()
-	envelope.WriteError(rr, httptest.NewRequest("POST", "/api/v1/sessions/"+string(f.id)+"/send", nil), err)
+	envelope.WriteError(rr, httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+string(f.id)+"/send", nil), err)
 	if rr.Code != 409 || !strings.Contains(rr.Body.String(), "AGENT_EXITED") {
 		t.Fatalf("T01: response = %d %s, want 409 AGENT_EXITED (err=%v)", rr.Code, rr.Body.String(), err)
 	}
