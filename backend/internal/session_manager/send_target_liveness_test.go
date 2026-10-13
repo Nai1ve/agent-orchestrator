@@ -353,3 +353,31 @@ func TestTransitionOutboxRetainsMessageForExitedTUITarget(t *testing.T) {
 		t.Fatalf("pending=%d pane writes=%d, want the message retained and unwritten", len(pending), len(store.messenger.msgs))
 	}
 }
+
+// T05: with no caller deadline, the manager's own bound still ends a probe
+// that never answers, so a held input lease cannot block mutations forever.
+func TestSend_HungTargetProbeIsBoundedWithoutCallerDeadline(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["s1"] = launchedTUISession("s1", "launch-a")
+	msg := &fakeMessenger{}
+	m, rt := newBlockingProbeManager(t, st, msg)
+	sent := make(chan error, 1)
+	started := time.Now()
+	go func() { sent <- m.Send(context.Background(), "s1", "hello", nil) }()
+	<-rt.entered
+	select {
+	case err := <-sent:
+		elapsed := time.Since(started)
+		if elapsed < sendTargetProbeTimeout {
+			t.Fatalf("probe ended after %v, before the %v bound", elapsed, sendTargetProbeTimeout)
+		}
+		if err == nil || errors.Is(err, ErrAgentExited) || !errors.Is(err, ports.ErrRuntimeProbeInconclusive) {
+			t.Fatalf("Send = %v, want an inconclusive-probe error", err)
+		}
+	case <-time.After(sendTargetProbeTimeout + 5*time.Second):
+		t.Fatal("background send was not bounded by the manager's probe timeout")
+	}
+	if len(msg.msgs) != 0 {
+		t.Fatalf("writes = %q, want none", msg.msgs)
+	}
+}
