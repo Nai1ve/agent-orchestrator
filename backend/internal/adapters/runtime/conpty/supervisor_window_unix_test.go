@@ -4,6 +4,7 @@ package conpty
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/procmem"
 )
 
 // runTestSupervisor mirrors `ao agent-process supervise`'s process shape: it
@@ -175,5 +177,37 @@ func TestExactProbeUsesDirectChildForUnsupervisedLaunch(t *testing.T) {
 			t.Fatalf("direct agent exit never observed: %+v", probe)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// T05 (native): when the process table cannot be read, a supervised launch is
+// unknown rather than alive or dead.
+func TestExactProbeTreatsUnreadableProcessTableAsUnknown(t *testing.T) {
+	w := startSupervisedWindow(t, "t05-native", "launch-1", true)
+	w.rt.processTable = func(context.Context) (*procmem.Table, error) {
+		return nil, errors.New("ps: permission denied")
+	}
+	ctx := context.Background()
+	if probe := w.rt.ProbeFencedRuntime(ctx, w.ref); probe.Liveness != ports.FencedUnknown || probe.Reason != ports.FencedReasonProbeFailed {
+		t.Fatalf("fenced probe = %+v, want unknown/probe_failed", probe)
+	}
+	if alive, err := w.rt.IsExactSupervisedProcessAlive(ctx, w.handle, w.exact); err == nil || alive || !errors.Is(err, ports.ErrRuntimeProbeInconclusive) {
+		t.Fatalf("exact probe = %v, %v; want inconclusive error", alive, err)
+	}
+	// The ordinary reaper probe never consults the process table.
+	if alive, err := w.rt.IsSupervisedProcessAlive(ctx, w.handle, w.exact); err != nil || !alive {
+		t.Fatalf("ordinary supervised probe = %v, %v; want alive", alive, err)
+	}
+}
+
+// A daemon restart recovers the supervised flag from the registry, so the
+// report window is still not mistaken for a live agent.
+func TestSupervisedFlagSurvivesRegistryRecovery(t *testing.T) {
+	w := startSupervisedWindow(t, "t02-recovered", "launch-1", true)
+	w.exitAgent(t)
+	waitForTestFile(t, w.reporting, "reporting")
+	recovered := New(Options{RunFilePath: filepath.Join(filepath.Dir(w.input), "running.json")})
+	if probe := recovered.ProbeFencedRuntime(context.Background(), w.ref); probe.Liveness != ports.FencedDead {
+		t.Fatalf("recovered probe during report window = %+v, want dead", probe)
 	}
 }

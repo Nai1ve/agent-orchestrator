@@ -367,3 +367,40 @@ func TestNativeFeedbackToExitedAgentStaysUndelivered(t *testing.T) {
 		t.Fatalf("T04: CI feedback delivered %d times, want 1; log=%q", n, log)
 	}
 }
+
+// T06: after recovery to launch B, launch A's delayed supervisor exit report
+// and delayed reaper observation cannot fence B, and a send reaches only B.
+func TestNativeStaleLaunchFactsCannotFenceNewLaunch(t *testing.T) {
+	f := newNativeDeliveryFixture(t)
+	ctx := context.Background()
+	f.launch(t, "launch-a")
+	f.exitAgent(t)
+	destroyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	if err := f.runtime.Destroy(destroyCtx, ports.RuntimeHandle{ID: string(f.id)}); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	f.launch(t, "launch-b")
+
+	if err := f.lcm.ApplyActivitySignal(ctx, f.id, ports.ActivitySignal{
+		Valid: true, State: domain.ActivityExited, Event: "process-exited", LaunchID: "launch-a",
+	}); err != nil {
+		t.Fatalf("delayed exit report: %v", err)
+	}
+	if err := f.lcm.ApplyRuntimeObservation(ctx, f.id, ports.RuntimeFacts{
+		ObservedAt: time.Now().UTC(), Runtime: ports.ProbeAlive, Workload: ports.ProbeDead, LaunchID: "launch-a",
+	}); err != nil {
+		t.Fatalf("delayed reaper observation: %v", err)
+	}
+	if rec := f.session(t); rec.Activity.State != domain.ActivityIdle || rec.IsTerminated || rec.Metadata.RuntimeLaunchID != "launch-b" {
+		t.Fatalf("launch A's facts changed launch B: %+v launch=%s", rec.Activity, rec.Metadata.RuntimeLaunchID)
+	}
+	if err := f.sessions.Send(ctx, f.id, "T06 message for B", nil); err != nil {
+		t.Fatalf("send to launch B: %v", err)
+	}
+	waitForFile(t, f.inputLog("launch-b"), "T06 message for B")
+	if strings.Contains(readFile(f.inputLog("launch-a")), "T06 message for B") {
+		t.Fatal("launch B's message reached launch A")
+	}
+}
