@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -304,5 +305,79 @@ func TestExactProbeTreatsStartingSupervisorAsUnconfirmed(t *testing.T) {
 	waitForTestFile(t, w.reporting, "reporting")
 	if probe := w.rt.ProbeFencedRuntime(ctx, w.ref); probe.Liveness != ports.FencedDead || probe.Reason != ports.FencedReasonExactAbsent {
 		t.Fatalf("after observed agent exit = %+v, want dead/exact_absent", probe)
+	}
+}
+
+// Concurrent probes can finish out of order. A probe whose real process
+// snapshot was taken before the agent started must not be reinterpreted as an
+// exit because a newer probe observed the agent while it was paused. Only the
+// completion order of the snapshot reads is controlled; the snapshots are real.
+func TestExactProbeStaleStartupSnapshotIsNotExit(t *testing.T) {
+	w := createSupervisedWindow(t, "startup-concurrent", "launch-1", true, true)
+	waitForTestFile(t, w.starting, "starting")
+	snapshot := w.rt.processTable
+	sampled := make(chan struct{})
+	resume := make(chan struct{})
+	var first sync.Once
+	w.rt.processTable = func(ctx context.Context) (*procmem.Table, error) {
+		table, err := snapshot(ctx)
+		held := false
+		first.Do(func() { held = true })
+		if held {
+			close(sampled)
+			<-resume
+		}
+		return table, err
+	}
+	ctx := context.Background()
+	stale := make(chan ports.FencedProbeResult, 1)
+	go func() { stale <- w.rt.ProbeFencedRuntime(ctx, w.ref) }()
+	<-sampled // the older probe holds a snapshot taken before child.Start
+
+	w.releaseStart(t)
+	if probe := w.rt.ProbeFencedRuntime(ctx, w.ref); probe.Liveness != ports.FencedAlive {
+		t.Fatalf("newer probe after agent start = %+v, want alive", probe)
+	}
+	close(resume)
+	if probe := <-stale; probe.Liveness != ports.FencedUnknown || probe.Reason != ports.FencedReasonWorkloadUnconfirmed {
+		t.Fatalf("older pre-start snapshot = %+v, want unknown/workload_unconfirmed", probe)
+	}
+	if probe := w.rt.ProbeFencedRuntime(ctx, w.ref); probe.Liveness != ports.FencedAlive {
+		t.Fatalf("the agent never exited, latest probe = %+v", probe)
+	}
+	// The same ordering through the exact probe: never a definite "not alive".
+	exactSampled := make(chan struct{})
+	exactResume := make(chan struct{})
+	var exactFirst sync.Once
+	w.rt.processTable = func(ctx context.Context) (*procmem.Table, error) {
+		table, err := snapshot(ctx)
+		held := false
+		exactFirst.Do(func() { held = true })
+		if held {
+			close(exactSampled)
+			<-exactResume
+		}
+		return table, err
+	}
+	// Exit the agent while an exact probe holds a snapshot taken while it ran:
+	// a newer probe confirms the exit, and the older one still reports running.
+	type exactResult struct {
+		alive bool
+		err   error
+	}
+	older := make(chan exactResult, 1)
+	go func() {
+		alive, err := w.rt.IsExactSupervisedProcessAlive(ctx, w.handle, w.exact)
+		older <- exactResult{alive, err}
+	}()
+	<-exactSampled
+	w.exitAgent(t)
+	waitForTestFile(t, w.reporting, "reporting")
+	if probe := w.rt.ProbeFencedRuntime(ctx, w.ref); probe.Liveness != ports.FencedDead || probe.Reason != ports.FencedReasonExactAbsent {
+		t.Fatalf("newer probe after observed exit = %+v, want dead/exact_absent", probe)
+	}
+	close(exactResume)
+	if got := <-older; got.err != nil || !got.alive {
+		t.Fatalf("older snapshot taken while running = %v, %v; want running at that moment", got.alive, got.err)
 	}
 }
