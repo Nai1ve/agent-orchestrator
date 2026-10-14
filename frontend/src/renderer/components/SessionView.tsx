@@ -78,8 +78,8 @@ import { clientForSessionHost } from "../lib/host-clients";
 import { useHostConnection } from "../hooks/useHostConnection";
 import { sessionReviewsQueryKey } from "../lib/session-reviews";
 import { sessionUiKey } from "../lib/hosts";
-import { sessionWorkspaceFilesQueryOptions } from "../hooks/useSessionWorkspaceFiles";
-import { matchWorkspaceFilePath } from "../lib/workspace-file-path";
+import { resolveSessionWorkspacePath, sessionWorkspaceFilesQueryOptions } from "../hooks/useSessionWorkspaceFiles";
+import { isAbsoluteFileReference, matchWorkspaceFilePath, normalizeWorkspaceFileReference } from "../lib/workspace-file-path";
 import { markFileViewerPerformance } from "../lib/file-viewer-performance";
 import { aoBridge } from "../lib/bridge";
 import {
@@ -96,7 +96,7 @@ import { isMacPlatform } from "../lib/platform";
 import { useShell } from "../lib/shell-context";
 import { cn } from "../lib/utils";
 import { usesPreviewWorkspaceData } from "../lib/preview-mode";
-import { isOrchestratorSession, sessionAgentExited, sessionIsActive } from "../types/workspace";
+import { isOrchestratorSession, sessionAgentExited, sessionIsActive, type SessionArtifact, type WorkspaceSummary } from "../types/workspace";
 import { terminalTargetBelongsToSession, type TerminalTarget } from "../types/terminal";
 import { useCloudSessionPresence } from "../hooks/useCloudSessionPresence";
 import { focusAfterPaint, useSessionShortcut } from "../hooks/useAppShortcut";
@@ -1497,13 +1497,63 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 		);
 	}, [hostId, queryClient, sessionId, t]);
 
+	const handleOpenArtifact = useCallback(
+		(target: { feedback?: boolean; path: string }) => {
+			if (browserOnly) return;
+			setBrowserPopOutState({ sessionId, phase: "docked" });
+			setFilesPoppedOut(false);
+			transitionInspectorView("artifacts");
+			setInspectorOpenForSession(uiSessionId, true);
+			setArtifactRequestsBySession((current) => ({
+				...current,
+				[uiSessionId]: { feedback: target.feedback, path: target.path, key: (current[uiSessionId]?.key ?? 0) + 1 },
+			}));
+		},
+		[browserOnly, sessionId, setInspectorOpenForSession, transitionInspectorView, uiSessionId],
+	);
+
+	// A file written moments ago, or one past the artifact list cap, is not in
+	// the cached session, and the Files inspector can only show listed
+	// artifacts. Refresh once before deciding it cannot be opened.
+	const revealResolvedArtifact = useCallback(
+		async (path: string) => {
+			if (browserOnly) return false;
+			const listed = (artifacts: SessionArtifact[] | undefined) => artifacts?.some((artifact) => artifact.path === path) ?? false;
+			if (!listed(session?.artifactFiles)) {
+				await refreshWorkspaces();
+				const refreshed = queryClient.getQueryData<WorkspaceSummary[]>(workspaceQueryKeyForHost(hostId))
+					?.flatMap((workspace) => workspace.sessions)
+					.find((candidate) => candidate.id === sessionId);
+				if (!listed(refreshed?.artifactFiles)) return false;
+			}
+			handleOpenArtifact({ path });
+			return true;
+		},
+		[browserOnly, handleOpenArtifact, hostId, queryClient, refreshWorkspaces, session?.artifactFiles, sessionId],
+	);
+
 	const revealResolvedWorkspaceFile = useCallback(
 		async (rawPath: string, options?: FileOpenOptions) => {
-			const data = await fetchWorkspaceFiles();
-			const path = matchWorkspaceFilePath(rawPath, data.files ?? []);
-			openCenterFile(path, options);
+			const reference = normalizeWorkspaceFileReference(rawPath);
+			if (!isAbsoluteFileReference(reference)) {
+				const data = await fetchWorkspaceFiles();
+				openCenterFile(matchWorkspaceFilePath(rawPath, data.files ?? []), options);
+				return;
+			}
+			// The renderer is never told where a session's worktree lives, so the
+			// daemon decides which root an absolute path belongs to.
+			const resolved = await resolveSessionWorkspacePath(sessionId, reference, hostId);
+			if (resolved?.kind === "workspace") {
+				openCenterFile(resolved.path, options);
+				return;
+			}
+			if (resolved?.kind === "artifact" && await revealResolvedArtifact(resolved.path)) return;
+			// Outside the session, or the daemon could not say. Nothing shows the
+			// path belongs here, so open it as written and let the file pane say
+			// so, rather than a workspace file that happens to share its name.
+			openCenterFile(reference, options);
 		},
-		[openCenterFile, fetchWorkspaceFiles],
+		[fetchWorkspaceFiles, hostId, openCenterFile, revealResolvedArtifact, sessionId],
 	);
 
 	const handleOpenFiles = useCallback(() => {
@@ -1527,20 +1577,6 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 		[revealResolvedWorkspaceFile],
 	);
 
-	const handleOpenArtifact = useCallback(
-		(target: { feedback?: boolean; path: string }) => {
-			if (browserOnly) return;
-			setBrowserPopOutState({ sessionId, phase: "docked" });
-			setFilesPoppedOut(false);
-			transitionInspectorView("artifacts");
-			setInspectorOpenForSession(uiSessionId, true);
-			setArtifactRequestsBySession((current) => ({
-				...current,
-				[uiSessionId]: { feedback: target.feedback, path: target.path, key: (current[uiSessionId]?.key ?? 0) + 1 },
-			}));
-		},
-		[browserOnly, sessionId, setInspectorOpenForSession, transitionInspectorView, uiSessionId],
-	);
 	const handleArtifactRequestConsumed = useCallback((key: number) => {
 		setArtifactRequestsBySession((current) => {
 			const request = current[uiSessionId];

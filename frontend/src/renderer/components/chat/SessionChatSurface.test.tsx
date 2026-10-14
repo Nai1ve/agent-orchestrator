@@ -674,6 +674,11 @@ describe("SessionChatSurface link routing", () => {
 		const localSession = { ...session, id: "session-local-html" };
 		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
 		const openInBrowser = vi.fn().mockResolvedValue(undefined);
+		// The link is absolute, so the daemon says which root owns it before the
+		// page is previewed.
+		getMock.mockImplementation(async (path: string) => path === "/api/v1/sessions/{sessionId}/workspace/resolve"
+			? { data: { sessionId: localSession.id, kind: "workspace", path: "test-ui.html" }, error: undefined }
+			: { data: { switches: agentSwitchState.data }, error: undefined, response: { status: 200 } });
 		const view = render(<Wrapper client={queryClient}><SessionChatSurface session={localSession} onOpenLinkInBrowser={openInBrowser} /></Wrapper>);
 		conversationState.snapshot = {
 			capabilities: [],
@@ -683,6 +688,30 @@ describe("SessionChatSurface link routing", () => {
 		await waitFor(() => expect(openInBrowser).toHaveBeenCalledWith(
 			expect.stringContaining("/api/v1/sessions/session-local-html/preview/files/test-ui.html"),
 		));
+		expect(postMock).not.toHaveBeenCalled();
+	});
+
+	it("does not automatically preview or open an absolute HTML link outside the session", async () => {
+		workspacePathsState.paths = ["test-ui.html"];
+		const localSession = { ...session, id: "session-outside-html" };
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+		const openInBrowser = vi.fn().mockResolvedValue(undefined);
+		const onOpenFile = vi.fn();
+		getMock.mockImplementation(async (path: string) => path === "/api/v1/sessions/{sessionId}/workspace/resolve"
+			? { data: { sessionId: localSession.id, kind: "outside", path: "" }, error: undefined }
+			: { data: { switches: agentSwitchState.data }, error: undefined, response: { status: 200 } });
+		const view = render(<Wrapper client={queryClient}><SessionChatSurface session={localSession} onOpenFile={onOpenFile} onOpenLinkInBrowser={openInBrowser} /></Wrapper>);
+		conversationState.snapshot = {
+			capabilities: [],
+			items: [{ kind: "message", id: "assistant-outside-html", sequence: 1, revision: 1, role: "assistant", origin: "provider", text: "Done: [`test-ui.html`](/other-repo/test-ui.html)", streaming: false, createdAt: "2026-08-08T00:00:01Z" }],
+		};
+		view.rerender(<Wrapper client={queryClient}><SessionChatSurface session={localSession} onOpenFile={onOpenFile} onOpenLinkInBrowser={openInBrowser} /></Wrapper>);
+		await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/sessions/{sessionId}/workspace/resolve", {
+			params: { path: { sessionId: localSession.id }, query: { path: "/other-repo/test-ui.html" } },
+		}));
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(openInBrowser).not.toHaveBeenCalled();
+		expect(onOpenFile).not.toHaveBeenCalled();
 		expect(postMock).not.toHaveBeenCalled();
 	});
 
@@ -1196,6 +1225,7 @@ describe("project remembering waits for provider permissions", () => {
 describe("side command routing", () => {
 	beforeEach(() => {
 		useUiStore.setState({ developerMode: true, sideChats: true });
+		conversationState.snapshot = { ...conversationState.snapshot, capabilities: ["resume"] };
 	});
 	afterEach(() => {
 		useUiStore.setState({ developerMode: false, sideChats: false });
@@ -1204,7 +1234,6 @@ describe("side command routing", () => {
 	it.each([
 		["side chats are off", { developerMode: true, sideChats: false }, "codex"],
 		["Developer mode is off", { developerMode: false, sideChats: true }, "codex"],
-		["the harness cannot run sides", { developerMode: true, sideChats: true }, "cursor"],
 	] as const)("sends /btw to the main chat when %s", async (_case, flags, provider) => {
 		useUiStore.setState(flags);
 		sideMocks.create.mockReset();
@@ -1265,4 +1294,15 @@ describe("side command routing", () => {
 			);
 		},
 	);
+	it.each(["btw", "side"])("preserves provider /%s when resume is unavailable", async (command) => {
+		conversationState.snapshot = { ...conversationState.snapshot, capabilities: [] };
+		sideMocks.create.mockReset();
+		const mainSend = vi.fn().mockResolvedValue(undefined);
+		(conversationCommandState as { send?: unknown }).send = mainSend;
+		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={session} /></Wrapper>);
+		await act(async () => { await sideMocks.workspaceSend!(`/${command} question`, undefined, "provider-command"); });
+		expect(sideMocks.create).not.toHaveBeenCalled();
+		expect(mainSend).toHaveBeenCalledWith(expect.objectContaining({ text: `/${command} question` }));
+		delete (conversationCommandState as { send?: unknown }).send;
+	});
 });

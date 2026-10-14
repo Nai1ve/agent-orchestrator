@@ -383,9 +383,14 @@ vi.mock("./chat/SessionChatSurface", async () => {
 				{tabStripAction}
 			</div>
 			{onOpenFile ? (
-				<button type="button" onClick={() => onOpenFile("notes.txt", 120)}>
-					open chat basename
-				</button>
+				<>
+					<button type="button" onClick={() => onOpenFile("notes.txt", 120)}>
+						open chat basename
+					</button>
+					<button type="button" onClick={() => onOpenFile("/Users/me/worktrees/s/src/App.tsx", 7)}>
+						open chat absolute path
+					</button>
+				</>
 			) : null}
 			{reviewerTerminal ? (
 				<button type="button" onClick={() => onOpenReviewerTerminal?.(reviewerTerminal)}>
@@ -4995,6 +5000,93 @@ describe("SessionView", () => {
 		expect(inspectorOpen("sess-orch")).toBe(true);
 		expect(screen.getByRole("button", { name: "Close Browser" })).toHaveAttribute("aria-pressed", "true");
 		expect(useUiStore.getState().inspectorSessions["sess-orch"]?.view).toBe("browser");
+	});
+
+	it("opens an absolute chat path at the workspace-relative path the daemon returns", async () => {
+		const defaultGet = reviewGetMock.getMockImplementation()!;
+		reviewGetMock.mockImplementation(async (path: string, ...args: unknown[]) =>
+			path === "/api/v1/sessions/{sessionId}/workspace/resolve"
+				? { data: { sessionId: "sess-orch", kind: "workspace", path: "src/App.tsx" }, error: undefined }
+				: defaultGet(path, ...args));
+		workerSession("sess-orch").mode = "chat";
+		render(<SessionView sessionId="sess-orch" />);
+		fireEvent.click(screen.getByRole("button", { name: "open chat absolute path" }));
+		const file = await screen.findByTestId("session-file-workspace");
+		expect(file).toHaveTextContent("src/App.tsx");
+		expect(file).not.toHaveTextContent("/Users/me");
+		expect(file).toHaveAttribute("data-line", "7");
+		expect(reviewGetMock).toHaveBeenCalledWith("/api/v1/sessions/{sessionId}/workspace/resolve", {
+			params: { path: { sessionId: "sess-orch" }, query: { path: "/Users/me/worktrees/s/src/App.tsx" } },
+		});
+	});
+
+	function mockAbsolutePathLookup(resolve: unknown) {
+		reviewGetMock.mockImplementation(async (path: string) => {
+			if (path === "/api/v1/sessions/{sessionId}/workspace/resolve") return resolve;
+			if (path === "/api/v1/sessions/{sessionId}/workspace/manifest") {
+				return {
+					data: {
+						sessionId: "sess-orch",
+						files: [{ path: "src/App.tsx", status: "modified", additions: 1, deletions: 0, binary: false, size: 10 }],
+						truncated: false,
+						sections: { staged: [], unstaged: [], untracked: [], committed: [] },
+						commits: [],
+						summary: { files: 1, additions: 1, deletions: 0 },
+					},
+					error: undefined,
+				};
+			}
+			return { data: { reviewerHandleId: "", reviews: [], runs: [] }, error: undefined };
+		});
+	}
+
+	it("does not open a same-named workspace file for a path the daemon places outside the session", async () => {
+		mockAbsolutePathLookup({ data: { sessionId: "sess-orch", kind: "outside", path: "" }, error: undefined });
+		workerSession("sess-orch").mode = "chat";
+		render(<SessionView sessionId="sess-orch" />);
+		fireEvent.click(screen.getByRole("button", { name: "open chat absolute path" }));
+		expect(await screen.findByTestId("session-file-workspace")).toHaveTextContent("/Users/me/worktrees/s/src/App.tsx");
+	});
+
+	it("does not guess from the file list when the daemon cannot resolve an absolute chat path", async () => {
+		mockAbsolutePathLookup({ data: undefined, error: { code: "NOT_IMPLEMENTED" } });
+		workerSession("sess-orch").mode = "chat";
+		render(<SessionView sessionId="sess-orch" />);
+		fireEvent.click(screen.getByRole("button", { name: "open chat absolute path" }));
+		expect(await screen.findByTestId("session-file-workspace")).toHaveTextContent("/Users/me/worktrees/s/src/App.tsx");
+	});
+
+	it("opens an absolute chat path to a listed artifact in the Artifacts view", async () => {
+		const worker = workerSession("sess-1");
+		worker.mode = "chat";
+		worker.artifactFiles = [{ kind: "markdown", name: "report.md", path: "out/report.md", size: 10, updatedAt: "2026-06-10T00:00:00Z" }];
+		mockAbsolutePathLookup({ data: { sessionId: "sess-1", kind: "artifact", path: "out/report.md" }, error: undefined });
+		try {
+			render(<SessionView sessionId="sess-1" />);
+			fireEvent.click(screen.getByRole("button", { name: "open chat absolute path" }));
+			expect(await screen.findByText("selected out/report.md")).toBeInTheDocument();
+			expect(useUiStore.getState().inspectorSessions["sess-1"]?.view).toBe("artifacts");
+			expect(screen.queryByTestId("session-file-workspace")).not.toBeInTheDocument();
+		} finally {
+			delete worker.artifactFiles;
+		}
+	});
+
+	it("explains an artifact the session still does not list after a refresh", async () => {
+		workerSession("sess-1").mode = "chat";
+		mockAbsolutePathLookup({ data: { sessionId: "sess-1", kind: "artifact", path: "out/new.md" }, error: undefined });
+		render(<SessionView sessionId="sess-1" />);
+		fireEvent.click(screen.getByRole("button", { name: "open chat absolute path" }));
+		expect(await screen.findByTestId("session-file-workspace")).toHaveTextContent("/Users/me/worktrees/s/src/App.tsx");
+		expect(screen.queryByText("selected out/new.md")).not.toBeInTheDocument();
+	});
+
+	it("does not ask the daemon about relative chat paths", async () => {
+		workerSession("sess-orch").mode = "chat";
+		render(<SessionView sessionId="sess-orch" />);
+		fireEvent.click(screen.getByRole("button", { name: "open chat basename" }));
+		await screen.findByTestId("session-file-workspace");
+		expect(reviewGetMock.mock.calls.some(([path]) => path === "/api/v1/sessions/{sessionId}/workspace/resolve")).toBe(false);
 	});
 
 	it("opens orchestrator chat files in the center without revealing Browser", async () => {

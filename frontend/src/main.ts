@@ -205,10 +205,14 @@ const ignoreStdStreamError = (err: NodeJS.ErrnoException): void => {
 process.stdout.on("error", ignoreStdStreamError);
 process.stderr.on("error", ignoreStdStreamError);
 
+// The name shown in window titles, the menu bar, the dock, and the About panel.
+// Packaged bundle and installer filenames are unchanged.
+const APP_DISPLAY_NAME = "Orchestrator.inc";
+
 // Must run before app ready so the About panel and default-menu role labels use it.
 // Unpackaged runs get a distinct name so the dev window, dock menu, and About
 // panel never impersonate the installed app (#3642).
-app.setName(app.isPackaged ? "Agent Orchestrator" : "Agent Orchestrator (dev)");
+app.setName(app.isPackaged ? APP_DISPLAY_NAME : `${APP_DISPLAY_NAME} (dev)`);
 
 // Windows shows native toasts only when the app declares an AppUserModelID that
 // matches its installer shortcut (the NSIS maker's appId). Without it,
@@ -746,7 +750,7 @@ async function createWindowInternal(): Promise<void> {
 		height: 860,
 		minWidth: 960,
 		minHeight: 640,
-		title: app.isPackaged ? "Agent Orchestrator" : "Agent Orchestrator (dev)",
+		title: app.isPackaged ? APP_DISPLAY_NAME : `${APP_DISPLAY_NAME} (dev)`,
 		icon: windowIconPath(),
 		backgroundColor: NATIVE_WINDOW_BACKGROUND_DARK,
 		// Shown once the renderer has loaded (showWhenRendererLoaded below), so the
@@ -2428,8 +2432,8 @@ ipcMain.handle("menu:action", (_event, action: string) => {
 		case "help.about":
 			void dialog.showMessageBox(win, {
 				type: "info",
-				title: "About Agent Orchestrator",
-				message: "Agent Orchestrator",
+				title: `About ${APP_DISPLAY_NAME}`,
+				message: APP_DISPLAY_NAME,
 				detail: `Version ${app.getVersion()}`,
 				buttons: ["OK"],
 			});
@@ -3179,7 +3183,7 @@ app.whenReady().then(async () => {
 					defaultId: 0,
 					cancelId: 1,
 					title: "Remove old AO copies",
-					message: "Old copies of Agent Orchestrator can replace your updated app.",
+					message: `Old copies of ${APP_DISPLAY_NAME} can replace your updated app.`,
 					detail: `${formatStaleAppCopies(copies)}\n\nMove these copies to Trash to prevent another downgrade. Your AO projects and sessions will not be removed.`,
 					noLink: true,
 				});
