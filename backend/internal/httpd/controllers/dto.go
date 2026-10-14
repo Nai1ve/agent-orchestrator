@@ -2452,6 +2452,18 @@ type UnregisterPushDeviceResponse struct {
 
 /* ---- chat conversations ------------------------------------------------ */
 
+// ConversationPromptSuggestionRequest identifies the latest completed turn.
+type ConversationPromptSuggestionRequest struct {
+	TurnID string `json:"turnId"`
+}
+
+// ConversationPromptSuggestionResponse offers one optional next human message.
+type ConversationPromptSuggestionResponse struct {
+	TurnID string `json:"turnId"`
+	// Empty when there is no useful suggestion.
+	Prompt string `json:"prompt"`
+}
+
 // SetChatViewRequest renews or releases one renderer's Chat view lease.
 type SetChatViewRequest struct {
 	ViewID        string `json:"viewId"`
