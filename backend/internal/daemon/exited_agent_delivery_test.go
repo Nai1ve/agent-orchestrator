@@ -73,7 +73,7 @@ func newNativeDeliveryFixture(t *testing.T) *nativeDeliveryFixture {
 	}
 	lifecycleMessenger := newModeAwareMessenger()
 	lcm := newDeliveryLifecycle(store, lifecycleMessenger, agents)
-	svc, _, sessMgr, err := startSession(ctx, cfg, rt, store, lcm, newSessionMessenger(store, rt, log),
+	svc, _, sessMgr, err := startSession(ctx, cfg, rt, store, lcm, nil, newSessionMessenger(store, rt, log),
 		telemetryadapter.NoopSink{}, nil, agents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, log)
 	if err != nil {
 		t.Fatal(err)
