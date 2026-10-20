@@ -14,7 +14,6 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/conpty/ptyregistry"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
-	"github.com/aoagents/agent-orchestrator/backend/internal/procmem"
 )
 
 const (
@@ -95,7 +94,8 @@ type Runtime struct {
 	unregisterHost func(context.Context, string) error
 	destroyWait    time.Duration
 	destroyPoll    time.Duration
-	processTable   func(context.Context) (*procmem.Table, error)
+	// managedChildren lists the supervisor's running direct children.
+	managedChildren func(context.Context, int) (managedChildren, error)
 
 	mu       sync.Mutex
 	sessions map[string]*hostSession // sessionID -> live session
@@ -113,16 +113,16 @@ func New(opts Options) *Runtime {
 		unregisterHost = opts.UnregisterHost
 	}
 	return &Runtime{
-		spawner:        sp,
-		killHost:       clientKill,
-		pidIsAlive:     pidAlive,
-		processFinder:  findProcess,
-		registerHost:   ptyregistry.Register,
-		unregisterHost: unregisterHost,
-		destroyWait:    500 * time.Millisecond,
-		destroyPoll:    25 * time.Millisecond,
-		processTable:   func(ctx context.Context) (*procmem.Table, error) { return procmem.Snapshot(ctx, nil) },
-		sessions:       make(map[string]*hostSession),
+		spawner:         sp,
+		killHost:        clientKill,
+		pidIsAlive:      pidAlive,
+		processFinder:   findProcess,
+		registerHost:    ptyregistry.Register,
+		unregisterHost:  unregisterHost,
+		destroyWait:     500 * time.Millisecond,
+		destroyPoll:     25 * time.Millisecond,
+		managedChildren: snapshotManagedChildren,
+		sessions:        make(map[string]*hostSession),
 	}
 }
 
@@ -480,7 +480,7 @@ const (
 	workloadExited
 )
 
-// supervisedWorkload inspects the supervisor's descendants. Absence alone is
+// supervisedWorkload inspects the supervisor's children. Absence alone is
 // not exit evidence: a healthy supervisor has no child until child.Start, so
 // exit is concluded only after this launch's agent was observed. A failed
 // process-table read is returned as an error.
@@ -497,12 +497,16 @@ func (r *Runtime) supervisedWorkload(ctx context.Context, sess *hostSession, sup
 	r.mu.Lock()
 	observedBeforeSnapshot := sess.agentObserved
 	r.mu.Unlock()
-	table, err := r.processTable(ctx)
+	children, err := r.managedChildren(ctx, supervisorPID)
 	if err != nil {
 		return workloadUnconfirmed, fmt.Errorf("conpty: inspect supervisor %d: %w", supervisorPID, errors.Join(ports.ErrRuntimeProbeInconclusive, err))
 	}
-	// Tree includes the supervisor itself; any further process is its agent.
-	hasChild := len(table.Tree(supervisorPID).Processes) > 1
+	if !children.supervisorListed {
+		// The host just reported its child alive; a snapshot without that row is
+		// incomplete evidence, not proof that the agent is gone.
+		return workloadUnconfirmed, fmt.Errorf("conpty: supervisor %d missing from process snapshot: %w", supervisorPID, ports.ErrRuntimeProbeInconclusive)
+	}
+	hasChild := children.running > 0
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	switch {

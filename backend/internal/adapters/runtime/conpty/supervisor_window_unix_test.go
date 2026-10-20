@@ -16,7 +16,6 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
-	"github.com/aoagents/agent-orchestrator/backend/internal/procmem"
 )
 
 // runTestSupervisor mirrors `ao agent-process supervise`'s process shape: it
@@ -230,8 +229,8 @@ func TestExactProbeUsesDirectChildForUnsupervisedLaunch(t *testing.T) {
 // unknown rather than alive or dead.
 func TestExactProbeTreatsUnreadableProcessTableAsUnknown(t *testing.T) {
 	w := startSupervisedWindow(t, "t05-native", "launch-1", true)
-	w.rt.processTable = func(context.Context) (*procmem.Table, error) {
-		return nil, errors.New("ps: permission denied")
+	w.rt.managedChildren = func(context.Context, int) (managedChildren, error) {
+		return managedChildren{}, errors.New("ps: permission denied")
 	}
 	ctx := context.Background()
 	if probe := w.rt.ProbeFencedRuntime(ctx, w.ref); probe.Liveness != ports.FencedUnknown || probe.Reason != ports.FencedReasonProbeFailed {
@@ -323,12 +322,12 @@ func TestExactProbeTreatsStartingSupervisorAsUnconfirmed(t *testing.T) {
 func TestExactProbeStaleStartupSnapshotIsNotExit(t *testing.T) {
 	w := createSupervisedWindow(t, "startup-concurrent", "launch-1", true, true)
 	waitForTestFile(t, w.starting, "starting")
-	snapshot := w.rt.processTable
+	snapshot := w.rt.managedChildren
 	sampled := make(chan struct{})
 	resume := make(chan struct{})
 	var first sync.Once
-	w.rt.processTable = func(ctx context.Context) (*procmem.Table, error) {
-		table, err := snapshot(ctx)
+	w.rt.managedChildren = func(ctx context.Context, pid int) (managedChildren, error) {
+		table, err := snapshot(ctx, pid)
 		held := false
 		first.Do(func() { held = true })
 		if held {
@@ -357,8 +356,8 @@ func TestExactProbeStaleStartupSnapshotIsNotExit(t *testing.T) {
 	exactSampled := make(chan struct{})
 	exactResume := make(chan struct{})
 	var exactFirst sync.Once
-	w.rt.processTable = func(ctx context.Context) (*procmem.Table, error) {
-		table, err := snapshot(ctx)
+	w.rt.managedChildren = func(ctx context.Context, pid int) (managedChildren, error) {
+		table, err := snapshot(ctx, pid)
 		held := false
 		exactFirst.Do(func() { held = true })
 		if held {
