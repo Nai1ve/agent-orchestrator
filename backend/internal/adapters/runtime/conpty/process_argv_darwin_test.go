@@ -11,8 +11,7 @@ import (
 )
 
 func TestParseProcArgs2(t *testing.T) {
-	raw := make([]byte, 4)
-	binary.LittleEndian.PutUint32(raw, 3)
+	raw := binary.LittleEndian.AppendUint32(nil, 3)
 	raw = append(raw, "/opt/ao\x00\x00\x00ao\x00agent-process\x00explain <defunct> processes\x00HOME=/x\x00"...)
 	got, err := parseProcArgs2(raw)
 	if err != nil {
