@@ -52,10 +52,13 @@ var validSessionID = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // hostSession is the in-memory state for a live pty-host connection.
 type hostSession struct {
-	addr       string
-	pid        int
-	launchID   string
-	supervised bool
+	addr     string
+	pid      int
+	launchID string
+	// supervision is whether the host's direct child is the AO supervisor.
+	// Guarded by Runtime.mu once the session is shared: an adopted entry that
+	// predates the field starts unknown and may be resolved by inspection.
+	supervision supervisionMode
 	// agentObserved records that this launch's supervisor was seen owning its
 	// managed agent. Guarded by Runtime.mu. In memory only: after a daemon
 	// restart an unobserved supervisor without a child stays unconfirmed.
@@ -96,6 +99,9 @@ type Runtime struct {
 	destroyPoll    time.Duration
 	// managedChildren lists the supervisor's running direct children.
 	managedChildren func(context.Context, int) (managedChildren, error)
+	// processArgv reads a process's full argv to identify adopted hosts whose
+	// supervision was never recorded.
+	processArgv func(context.Context, int) ([]string, error)
 
 	mu       sync.Mutex
 	sessions map[string]*hostSession // sessionID -> live session
@@ -122,6 +128,7 @@ func New(opts Options) *Runtime {
 		destroyWait:     500 * time.Millisecond,
 		destroyPoll:     25 * time.Millisecond,
 		managedChildren: snapshotManagedChildren,
+		processArgv:     processArgv,
 		sessions:        make(map[string]*hostSession),
 	}
 }
@@ -164,15 +171,18 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 	// If the daemon crashes after the child starts but before its PID/address
 	// update is durable, a fresh daemon must still see unknown ownership rather
 	// than exact absence.
-	supervised := supervisedLaunch(cfg.Argv)
+	supervision := supervisionDirect
+	if supervisedLaunch(cfg.Argv) {
+		supervision = supervisionSupervised
+	}
 	reservation := &hostSession{
-		addr: unresolvedHostAddress, launchID: cfg.Env[runtimeLaunchIDEnv], supervised: supervised, currentOwner: true,
+		addr: unresolvedHostAddress, launchID: cfg.Env[runtimeLaunchIDEnv], supervision: supervision, currentOwner: true,
 	}
 	r.sessions[id] = reservation
 	r.mu.Unlock()
 	if err := r.registerHost(ctx, ptyregistry.Entry{
 		SessionID: id, PtyHostPID: 0, PipePath: unresolvedHostAddress,
-		LaunchID: reservation.launchID, Supervised: supervised, RegisteredAt: time.Now().UTC().Format(time.RFC3339),
+		LaunchID: reservation.launchID, Supervised: supervision.recorded(), RegisteredAt: time.Now().UTC().Format(time.RFC3339),
 	}); err != nil {
 		r.mu.Lock()
 		delete(r.sessions, id)
@@ -203,13 +213,13 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 			// spawner could not prove cleanup. Retain its PID and launch fence in
 			// both memory and the restart registry. The sentinel address prevents
 			// ordinary client traffic while keeping the possible handle probeable.
-			sess := &hostSession{addr: unresolvedHostAddress, pid: pid, launchID: cfg.Env[runtimeLaunchIDEnv], supervised: supervised, currentOwner: true}
+			sess := &hostSession{addr: unresolvedHostAddress, pid: pid, launchID: cfg.Env[runtimeLaunchIDEnv], supervision: supervision, currentOwner: true}
 			r.mu.Lock()
 			r.sessions[id] = sess
 			r.mu.Unlock()
 			registryErr := r.registerHost(ctx, ptyregistry.Entry{
 				SessionID: id, PtyHostPID: pid, PipePath: unresolvedHostAddress,
-				LaunchID: sess.launchID, Supervised: supervised, RegisteredAt: time.Now().UTC().Format(time.RFC3339),
+				LaunchID: sess.launchID, Supervised: supervision.recorded(), RegisteredAt: time.Now().UTC().Format(time.RFC3339),
 			})
 			if registryErr != nil {
 				cause = errors.Join(cause, fmt.Errorf("retain unresolved pty-host ownership for %q: %w", id, registryErr))
@@ -223,7 +233,7 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 			return ports.RuntimeHandle{}, conptyPartialCreateFailure(cause, handle, ports.RuntimeCleanupFailed)
 		}
 		r.mu.Lock()
-		r.sessions[id] = &hostSession{addr: addr, pid: pid, launchID: cfg.Env[runtimeLaunchIDEnv], supervised: supervised, currentOwner: true}
+		r.sessions[id] = &hostSession{addr: addr, pid: pid, launchID: cfg.Env[runtimeLaunchIDEnv], supervision: supervision, currentOwner: true}
 		r.mu.Unlock()
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 		cleanupErr := r.Destroy(cleanupCtx, handle)
@@ -235,7 +245,7 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 	}
 
 	sess := &hostSession{
-		addr: addr, pid: pid, launchID: cfg.Env[runtimeLaunchIDEnv], supervised: supervised, currentOwner: true,
+		addr: addr, pid: pid, launchID: cfg.Env[runtimeLaunchIDEnv], supervision: supervision, currentOwner: true,
 		protocolVersion: conPTYHostProtocolVersion, protocolResolved: true,
 	}
 
@@ -248,7 +258,7 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 		PtyHostPID:   pid,
 		PipePath:     addr, // ponytail: reuse PipePath field for loopback addr
 		LaunchID:     sess.launchID,
-		Supervised:   sess.supervised,
+		Supervised:   supervision.recorded(),
 		RegisteredAt: time.Now().UTC().Format(time.RFC3339),
 	}); err != nil {
 		handle := ports.RuntimeHandle{ID: id}
@@ -452,7 +462,14 @@ func (r *Runtime) ProbeFencedRuntime(ctx context.Context, ref ports.FencedRuntim
 	if !status.Alive {
 		return ports.FencedProbeResult{Liveness: ports.FencedDead, Reason: ports.FencedReasonExactAbsent}
 	}
-	if sess.supervised {
+	supervision, err := r.resolveSupervision(ctx, sess, status.PID, string(ref.SessionID), ref.Generation)
+	switch {
+	case errors.Is(err, errSupervisorIdentityMismatch):
+		return ports.FencedProbeResult{Liveness: ports.FencedUnknown, Reason: ports.FencedReasonGenerationMismatch}
+	case err != nil:
+		return ports.FencedProbeResult{Liveness: ports.FencedUnknown, Reason: ports.FencedReasonSupervisionUnknown}
+	}
+	if supervision == supervisionSupervised {
 		workload, err := r.supervisedWorkload(ctx, sess, status.PID)
 		switch {
 		case err != nil:
@@ -527,6 +544,116 @@ func supervisedLaunch(argv []string) bool {
 	return len(argv) > 2 && argv[1] == "agent-process" && argv[2] == "supervise"
 }
 
+// supervisionMode is whether a host's direct child is the AO supervisor.
+// The zero value is unknown: only an explicit record or inspection makes it
+// known, so missing metadata can never be mistaken for a direct child.
+type supervisionMode int
+
+const (
+	supervisionUnknown supervisionMode = iota
+	supervisionSupervised
+	supervisionDirect
+)
+
+// recorded is the registry form: nil for unknown, explicit true or false.
+func (m supervisionMode) recorded() *bool {
+	switch m {
+	case supervisionSupervised:
+		v := true
+		return &v
+	case supervisionDirect:
+		v := false
+		return &v
+	default:
+		return nil
+	}
+}
+
+func supervisionFromRecord(v *bool) supervisionMode {
+	switch {
+	case v == nil:
+		return supervisionUnknown
+	case *v:
+		return supervisionSupervised
+	default:
+		return supervisionDirect
+	}
+}
+
+// errSupervisorIdentityMismatch: the host's child is an AO supervisor for a
+// different session or launch than the one being probed.
+var errSupervisorIdentityMismatch = errors.New("conpty: host child is a supervisor for another launch")
+
+// resolveSupervision returns the host's recorded supervision, or identifies an
+// adopted host that predates the record from its live child's full argv. Only
+// an exact AO supervisor invocation for this session and launch counts as
+// supervised; any other readable argv is a direct child. An unreadable or
+// empty argv leaves supervision unknown and returns an inconclusive error, so
+// a live supervisor or host alone never proves a live agent. The answer is
+// cached for the session: the host's child does not change within a launch.
+func (r *Runtime) resolveSupervision(ctx context.Context, sess *hostSession, childPID int, sessionID, launchID string) (supervisionMode, error) {
+	r.mu.Lock()
+	known := sess.supervision
+	r.mu.Unlock()
+	if known != supervisionUnknown {
+		return known, nil
+	}
+	if childPID <= 0 {
+		return supervisionUnknown, fmt.Errorf("conpty: host child pid unavailable: %w", ports.ErrRuntimeProbeInconclusive)
+	}
+	argv, err := r.processArgv(ctx, childPID)
+	if err != nil {
+		return supervisionUnknown, fmt.Errorf("conpty: identify host child %d: %w", childPID, errors.Join(ports.ErrRuntimeProbeInconclusive, err))
+	}
+	if len(argv) == 0 {
+		return supervisionUnknown, fmt.Errorf("conpty: host child %d exposes no argv: %w", childPID, ports.ErrRuntimeProbeInconclusive)
+	}
+	resolved := supervisionDirect
+	if isSupervisor, matches := supervisorInvocation(argv, sessionID, launchID); isSupervisor {
+		if !matches {
+			return supervisionUnknown, fmt.Errorf("%w: %w", errSupervisorIdentityMismatch, ports.ErrRuntimeProbeInconclusive)
+		}
+		resolved = supervisionSupervised
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if sess.supervision == supervisionUnknown {
+		sess.supervision = resolved
+	}
+	return sess.supervision, nil
+}
+
+// supervisorInvocation parses an exact `<exe> agent-process supervise ...`
+// argv vector token by token, never a joined or truncated display string.
+// matches reports whether its --session and --launch name this launch.
+func supervisorInvocation(argv []string, sessionID, launchID string) (isSupervisor, matches bool) {
+	if len(argv) < 3 || argv[1] != "agent-process" || argv[2] != "supervise" {
+		return false, false
+	}
+	gotSession, gotLaunch := "", ""
+	for i := 3; i < len(argv) && argv[i] != "--"; i++ {
+		name, value, inline := strings.Cut(argv[i], "=")
+		if !inline {
+			if i+1 >= len(argv) {
+				break
+			}
+			value = argv[i+1]
+		}
+		switch name {
+		case "--session":
+			gotSession = value
+		case "--launch":
+			gotLaunch = value
+		default:
+			continue
+		}
+		if !inline {
+			i++
+		}
+	}
+	return true, sessionID != "" && launchID != "" && gotSession == sessionID && gotLaunch == launchID
+}
+
 // IsSupervisedProcessAlive uses the pty-host's child status. For a supervised
 // launch that child is the AO supervisor, whose lifetime matches the managed
 // agent process. When a generation ref is supplied, the launch id captured at
@@ -578,7 +705,11 @@ func (r *Runtime) IsExactSupervisedProcessAlive(ctx context.Context, handle port
 	if !hostAlive || !status.Alive {
 		return false, nil
 	}
-	if !sess.supervised {
+	supervision, err := r.resolveSupervision(ctx, sess, status.PID, string(ref.SessionID), ref.LaunchID)
+	if err != nil {
+		return false, err
+	}
+	if supervision == supervisionDirect {
 		return true, nil
 	}
 	workload, err := r.supervisedWorkload(ctx, sess, status.PID)
@@ -763,7 +894,7 @@ func (r *Runtime) resolveWithEvidence(ctx context.Context, id string) (*hostSess
 			continue
 		}
 		// Re-populate the map so subsequent calls skip the file scan.
-		recovered := &hostSession{addr: e.PipePath, pid: e.PtyHostPID, launchID: e.LaunchID, supervised: e.Supervised}
+		recovered := &hostSession{addr: e.PipePath, pid: e.PtyHostPID, launchID: e.LaunchID, supervision: supervisionFromRecord(e.Supervised)}
 		r.mu.Lock()
 		// Only store if another goroutine hasn't beaten us.
 		if r.sessions[id] == nil {

@@ -19,10 +19,11 @@ type Entry struct {
 	PtyHostPID int    `json:"ptyHostPid"`
 	PipePath   string `json:"pipePath"`
 	LaunchID   string `json:"launchId,omitempty"`
-	// Supervised records that the host's direct child is the AO supervisor
-	// rather than the agent itself. Entries written before this field existed
-	// read as false and keep their direct-child liveness semantics.
-	Supervised   bool   `json:"supervised,omitempty"`
+	// Supervised records whether the host's direct child is the AO supervisor
+	// (true) or the agent itself (false). It is tri-state: entries written
+	// before this field existed omit it, and nil means unknown, never a known
+	// direct child. Known false is stored explicitly.
+	Supervised   *bool  `json:"supervised,omitempty"`
 	RegisteredAt string `json:"registeredAt"` // RFC3339; set by caller
 }
 

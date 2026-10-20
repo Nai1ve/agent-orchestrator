@@ -5,6 +5,7 @@ package conpty
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -171,4 +172,48 @@ func TestLegacyEntryDirectChildKeepsDirectLiveness(t *testing.T) {
 	}
 	w.exitAgent(t)
 	waitForFencedLiveness(t, adopted, w.ref, ports.FencedDead)
+}
+
+// When an adopted pre-upgrade host's child cannot be identified, supervision
+// stays unknown: never alive from the live child alone, never dead, and not
+// cached, so a later readable identity still resolves it.
+func TestLegacyEntryUnidentifiableChildIsInconclusive(t *testing.T) {
+	w := startSupervisedWindow(t, "legacy-unreadable", "launch-1", true)
+	adopted := New(Options{RunFilePath: rewriteAsPreUpgradeEntry(t, w)})
+	for _, unreadable := range []func(context.Context, int) ([]string, error){
+		func(context.Context, int) ([]string, error) { return nil, errors.New("permission denied") },
+		func(context.Context, int) ([]string, error) { return nil, nil },
+	} {
+		adopted.processArgv = unreadable
+		ctx := context.Background()
+		if probe := adopted.ProbeFencedRuntime(ctx, w.ref); probe.Liveness != ports.FencedUnknown || probe.Reason != ports.FencedReasonSupervisionUnknown {
+			t.Fatalf("unidentifiable adopted host = %+v, want unknown/supervision_unknown", probe)
+		}
+		if alive, err := adopted.IsExactSupervisedProcessAlive(ctx, w.handle, w.exact); alive || !errors.Is(err, ports.ErrRuntimeProbeInconclusive) {
+			t.Fatalf("exact probe = %v, %v; want inconclusive", alive, err)
+		}
+	}
+	adopted.processArgv = processArgv
+	if probe := adopted.ProbeFencedRuntime(context.Background(), w.ref); probe.Liveness != ports.FencedAlive {
+		t.Fatalf("readable identity after failures = %+v, want alive", probe)
+	}
+}
+
+// An adopted host whose child is a supervisor for another launch is a
+// generation mismatch, not this launch's live agent and not its death.
+func TestLegacyEntrySupervisorForAnotherLaunchIsMismatch(t *testing.T) {
+	w := startSupervisedWindow(t, "legacy-mismatch", "launch-1", true)
+	adopted := New(Options{RunFilePath: rewriteAsPreUpgradeEntry(t, w)})
+	adopted.processArgv = func(ctx context.Context, pid int) ([]string, error) {
+		argv, err := processArgv(ctx, pid)
+		for i := range argv {
+			if argv[i] == "launch-1" {
+				argv[i] = "launch-0"
+			}
+		}
+		return argv, err
+	}
+	if probe := adopted.ProbeFencedRuntime(context.Background(), w.ref); probe.Liveness != ports.FencedUnknown || probe.Reason != ports.FencedReasonGenerationMismatch {
+		t.Fatalf("supervisor for another launch = %+v, want unknown/generation_mismatch", probe)
+	}
 }
