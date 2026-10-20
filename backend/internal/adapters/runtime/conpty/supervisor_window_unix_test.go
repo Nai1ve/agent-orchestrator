@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -38,6 +39,13 @@ func runTestSupervisor(args []string) int {
 	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := child.Start(); err != nil {
 		return 1
+	}
+	if marker := os.Getenv("AO_TEST_SUPERVISOR_CHILD_PID"); marker != "" {
+		_ = os.WriteFile(marker, []byte(strconv.Itoa(child.Process.Pid)), 0o600)
+	}
+	if os.Getenv("AO_TEST_SUPERVISOR_DEFER_REAP") != "" {
+		// Leave an exited agent unreaped (a zombie) until the test releases it.
+		awaitTestFile(os.Getenv("AO_TEST_SUPERVISOR_RELEASE"))
 	}
 	_ = child.Wait()
 	_ = os.WriteFile(os.Getenv("AO_TEST_SUPERVISOR_REPORTING"), []byte("reporting"), 0o600)
@@ -81,7 +89,7 @@ func startSupervisedWindow(t *testing.T, sessionID, launchID string, supervised 
 
 // createSupervisedWindow starts the host without waiting for the agent. With
 // gateStart, the supervisor stays alive without an agent until releaseStart.
-func createSupervisedWindow(t *testing.T, sessionID, launchID string, supervised, gateStart bool) *supervisedWindow {
+func createSupervisedWindow(t *testing.T, sessionID, launchID string, supervised, gateStart bool, agentArgs ...string) *supervisedWindow {
 	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
@@ -98,7 +106,7 @@ func createSupervisedWindow(t *testing.T, sessionID, launchID string, supervised
 	if gateStart {
 		w.startGate = filepath.Join(dir, "supervisor.start")
 	}
-	argv := []string{"/bin/sh", "-c", supervisedWindowAgent}
+	argv := append([]string{"/bin/sh", "-c", supervisedWindowAgent}, agentArgs...)
 	if supervised {
 		argv = append([]string{exe, "agent-process", "supervise", "--session", sessionID, "--launch", launchID, "--"}, argv...)
 	}

@@ -46,5 +46,15 @@ func runTestSupervisor(args []string) int {
 		return 1
 	}
 	_ = child.Wait()
+	if release := os.Getenv("AO_TEST_SUPERVISOR_RELEASE"); release != "" {
+		// Stay alive after the agent exits, as while reporting that exit.
+		_ = os.WriteFile(os.Getenv("AO_TEST_SUPERVISOR_REPORTING"), []byte("reporting"), 0o600)
+		for {
+			if _, err := os.Stat(release); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 	return 0
 }
