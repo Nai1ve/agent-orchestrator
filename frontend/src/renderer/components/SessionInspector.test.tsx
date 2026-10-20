@@ -700,6 +700,19 @@ describe("SessionInspector PR section", () => {
   });
 
   it("merges a ready pull request directly through the daemon", async () => {
+    postMock.mockImplementation(async (path: string) => path === "/api/v1/prs/{id}/merge" ? {
+      data: {
+        ok: true,
+        prNumber: 7,
+        method: "squash",
+        state: "merged",
+        stateChangedAt: "2026-10-19T11:06:22Z",
+      },
+      error: undefined,
+    } : {
+      data: { ok: true, sessionId: "sess-1" },
+      error: undefined,
+    });
     const readyPR = prSummary(7, "open", {
       url: "https://example.com/pr/7",
       headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -709,7 +722,11 @@ describe("SessionInspector PR section", () => {
         unresolvedBy: [],
       },
     });
-    renderWithQuery(
+    const respond = commonGetsResponder();
+    getMock.mockImplementation(async (path: string) => path === "/api/v1/sessions/{sessionId}/pr"
+      ? { data: { prs: [readyPR], linkedPrs: [] } }
+      : respond(path));
+    const { queryClient } = renderWithQuery(
       <SessionInspector session={session([pr(7, "open")])} />,
       undefined,
       (client) => {
@@ -730,6 +747,13 @@ describe("SessionInspector PR section", () => {
         },
       }),
     );
+    await waitFor(() =>
+      expect(queryClient.getQueryData<{ prs: SessionPRSummary[] }>(sessionScmSummaryQueryKey("sess-1"))?.prs[0]?.state).toBe("merged"),
+    );
+    await waitFor(() =>
+      expect(prSection("Pull request").getByText("merged")).toBeInTheDocument(),
+    );
+    expect(prSection("Pull request").queryByRole("button", { name: "Merge PR #7" })).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
@@ -965,7 +989,7 @@ describe("SessionInspector PR section", () => {
       const toggle = screen.getByRole("switch", { name });
       expect(toggle).toHaveClass("h-4", "w-8", "rounded-full");
       expect(toggle.querySelector("[data-slot='switch-thumb']")).toHaveClass(
-        "size-3",
+        "size-3.5",
         "rounded-full",
       );
     }
@@ -1216,7 +1240,7 @@ describe("SessionInspector Artifacts section", () => {
     );
   });
 
-  it("opens the Artifacts view from the More menu beside the tab list", async () => {
+  it("opens the Artifacts view from its own tab", async () => {
     const onViewChange = vi.fn();
     renderWithQuery(
       <SessionInspector
@@ -1227,20 +1251,44 @@ describe("SessionInspector Artifacts section", () => {
       />,
     );
 
-    const more = screen.getByRole("button", { name: "More" });
-    expect(screen.getByRole("tablist")).not.toContainElement(more);
+    expect(screen.queryByRole("button", { name: "More" })).not.toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Summary" })).toHaveAttribute("aria-selected", "true");
-    expect(more).not.toHaveAttribute("data-active");
 
-    await userEvent.click(more);
-    const menu = await screen.findByRole("menu");
-    expect(menu).toHaveAttribute("data-browser-native-overlay", "true");
-    await userEvent.click(within(menu).getByRole("menuitem", { name: "Artifacts" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Artifacts" }));
 
     expect(onViewChange).toHaveBeenCalledWith("artifacts");
     expect(await screen.findByRole("button", { name: /notes\.md/ })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Summary" })).toHaveAttribute("aria-selected", "false");
-    expect(screen.getByRole("button", { name: "More" })).toHaveAttribute("data-active");
+    expect(screen.getByRole("tab", { name: "Artifacts" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("keeps the Artifacts tab for a requested artifact the session does not list yet", () => {
+    const onViewChange = vi.fn();
+    renderWithQuery(
+      <SessionInspector
+        artifactRequest={{ key: 1, path: "fresh.md" }}
+        onViewChange={onViewChange}
+        session={session([], { artifactFiles: [] })}
+        view="artifacts"
+      />,
+    );
+
+    expect(screen.getByRole("tab", { name: "Artifacts" })).toHaveAttribute("aria-selected", "true");
+    expect(onViewChange).not.toHaveBeenCalledWith("summary");
+  });
+
+  it("keeps a requested Artifacts view while the session is loading", () => {
+    const onViewChange = vi.fn();
+    renderWithQuery(<SessionInspector onViewChange={onViewChange} view="artifacts" />);
+
+    expect(onViewChange).not.toHaveBeenCalled();
+  });
+
+  it("hides the Artifacts tab when the session has no artifacts", () => {
+    renderWithQuery(<SessionInspector session={session([], { artifactFiles: [] })} view="artifacts" />);
+
+    expect(screen.queryByRole("tab", { name: "Artifacts" })).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Summary" })).toHaveAttribute("aria-selected", "true");
   });
 
   it("does not render a feedback button on artifact rows", () => {
@@ -1476,7 +1524,7 @@ describe("SessionInspector Activity section", () => {
       screen.queryByRole("button", { name: "Resume agent" }),
     ).not.toBeInTheDocument();
     expect(
-      activitySectionElement().querySelector(".mt-3.border-t.pt-3"),
+      activitySectionElement().querySelector(".mt-3.border-t.pt-3:not([data-testid=session-account-summary])"),
     ).not.toBeInTheDocument();
 
     live.unmount();
@@ -1537,7 +1585,7 @@ describe("SessionInspector Activity section", () => {
       screen.queryByRole("button", { name: "Resume agent" }),
     ).not.toBeInTheDocument();
     expect(
-      activitySectionElement().querySelector(".mt-3.border-t.pt-3"),
+      activitySectionElement().querySelector(".mt-3.border-t.pt-3:not([data-testid=session-account-summary])"),
     ).not.toBeInTheDocument();
   });
 
@@ -4684,6 +4732,48 @@ describe("SessionInspector branch summary", () => {
 
   const sendCalls = () => postCallsFor("/api/v1/sessions/{sessionId}/send");
   const branch = () => within(screen.getByRole("region", { name: "Branch" }));
+
+  it.each(["provisioning", "ready"] as const)("shimmers while naming in %s and reveals the final branch when its worktree is ready", (provisionState) => {
+    mockGitState({});
+    const starting = session([], {
+      branch: "ao/sess-1/root",
+      provisionState,
+      provisionSteps: provisionState === "ready" ? [{ id: "worktree", status: "running" }] : [],
+    });
+    const view = renderWithQuery(<SessionInspector session={starting} />);
+    const namingLabel = branch().getByRole("status");
+    const namingText = namingLabel.textContent;
+    expect(namingLabel).toHaveClass("chat-working-shimmer");
+    expect(namingLabel).toHaveTextContent(/^(Generating branch name|Naming branch|Preparing branch|Initializing branch|Resolving branch name)$/);
+    expect(screen.queryByText("ao/sess-1/root")).not.toBeInTheDocument();
+
+    view.rerender(
+      <QueryClientProvider client={view.queryClient}>
+        <TooltipProvider>
+          <SessionInspector session={{ ...starting, provisionSteps: [{ id: "worktree", status: "running" }] }} />
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    expect(branch().getByRole("status").textContent).toBe(namingText);
+
+    view.rerender(
+      <QueryClientProvider client={view.queryClient}>
+        <TooltipProvider><SessionInspector session={{ ...starting, provisionState: "failed" }} /></TooltipProvider>
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByText(/^(Generating branch name|Naming branch|Preparing branch|Initializing branch|Resolving branch name)$/)).not.toBeInTheDocument();
+    expect(screen.queryByText("ao/sess-1/root")).not.toBeInTheDocument();
+
+    view.rerender(
+      <QueryClientProvider client={view.queryClient}>
+        <TooltipProvider>
+          <SessionInspector session={{ ...starting, branch: "ao/fix-login/root", provisionSteps: [{ id: "worktree", status: "done" }] }} />
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    expect(branch().getByText("ao/fix-login/root")).toBeInTheDocument();
+    expect(screen.queryByText(/^(Generating branch name|Naming branch|Preparing branch|Initializing branch|Resolving branch name)$/)).not.toBeInTheDocument();
+  });
 
   beforeEach(() => {
     useSessionGitActionStore.setState({ pending: {} });

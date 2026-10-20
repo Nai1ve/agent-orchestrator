@@ -132,6 +132,7 @@ export function toWorkspaceSession(
 			endedAt: step.endedAt ?? undefined,
 		})),
 		branchState: session.branchState,
+		staleBinary: session.staleBinary ? { version: session.staleBinary.version, since: session.staleBinary.since, switchFailedAt: session.staleBinary.switchFailedAt ?? undefined } : undefined,
 		isTerminated: session.isTerminated,
 		workspaceCleanup: session.workspaceCleanup,
 		chatProviderPreserved: session.chatProviderPreserved,
@@ -236,6 +237,7 @@ function toLocalWorkspaceSession(
 			endedAt: step.endedAt ?? undefined,
 		})),
 		branchState: session.branchState,
+		staleBinary: session.staleBinary ? { version: session.staleBinary.version, since: session.staleBinary.since, switchFailedAt: session.staleBinary.switchFailedAt ?? undefined } : undefined,
 		isTerminated: session.isTerminated,
 		workspaceCleanup: session.workspaceCleanup,
 		terminateOnPrMerge: session.terminateOnPrMerge ?? false,
@@ -265,6 +267,12 @@ function toLocalWorkspaceSession(
 // and always hits the real daemon.
 type FakeAgentSeam = { snapshot: () => WorkspaceSummary[] };
 
+class DaemonNotReadyError extends Error {
+	constructor() {
+		super("AO daemon API is not ready");
+	}
+}
+
 async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
 	if (usesPreviewWorkspaceData) {
 		const fake =
@@ -275,7 +283,7 @@ async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
 		return applyOptimisticSessionKills(snapshot) ?? snapshot;
 	}
 	if (!hasTrustedApiBaseUrl()) {
-		throw new Error("AO daemon API is not ready");
+		throw new DaemonNotReadyError();
 	}
 
 	const [{ data: projectsData, error: projectsError }, { data: sessionsData, error: sessionsError }] =
@@ -394,7 +402,12 @@ async function fetchRemoteWorkspaces(hostId: string): Promise<WorkspaceSummary[]
 export const workspaceQueryOptions = {
 	queryKey: workspaceQueryKey,
 	queryFn: fetchWorkspaces,
-	retry: 1,
+	// Retrying before the daemon is up only parks the query in a 1s backoff.
+	// Fetches started meanwhile (the ready-time invalidation, the shell's startup
+	// fetch) join that backoff instead of running, which held the first
+	// /projects + /sessions about 0.75s past "daemon listening" on cold launch.
+	// Fail fast instead; the daemon status change refetches.
+	retry: (failureCount: number, error: Error) => !(error instanceof DaemonNotReadyError) && failureCount < 1,
 	staleTime: 10_000,
 };
 

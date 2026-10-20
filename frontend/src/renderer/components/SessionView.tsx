@@ -42,6 +42,7 @@ import { SessionTopbarHost } from "./SessionTopbarPortal";
 import { TerminalSwitchAgentButton } from "./TerminalSwitchAgentButton";
 import { TopbarButton } from "./TopbarButton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+import { useAgentAccountLabel } from "../hooks/useAgentAccounts";
 import { useBrowserView } from "../hooks/useBrowserView";
 import { useFileAnnotation } from "../hooks/useFileAnnotation";
 import { useOpenArtifactPreview } from "../hooks/useOpenArtifactPreview";
@@ -418,6 +419,10 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 		: ambiguousRoute ? undefined : listedSession ?? directCloudSession ?? scopedFallback;
 	const interfaceContext = hostId ?? (session ? session.cloud ?? null : cloudOrgId && projectId ? { orgId: cloudOrgId } : undefined);
 	const interfaceUi = useSessionInterfaceSwitch(sessionId, session, interfaceContext);
+	const accountLabel = useAgentAccountLabel(Boolean(interfaceUi.accountMoveTarget));
+	const accountSwitchingLabel = interfaceUi.accountMoveTarget
+		? t("settings.agentAccounts.switching", { email: accountLabel(interfaceUi.accountMoveTarget) })
+		: undefined;
 	// Reading a cloud session counts as using it, so it is not idle-paused
 	// under someone who is watching the agent work.
 	useCloudSessionPresence(session?.cloud?.orgId, session?.cloud ? session.id : undefined, Boolean(session?.cloud));
@@ -594,6 +599,18 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 	const [handoffDialogOpen, setHandoffDialogOpen] = useState(false);
 	const handoffDialogContainerRef = useRef<HTMLDivElement | null>(null);
 	const [handoffDialogContainer, setHandoffDialogContainer] = useState<HTMLDivElement | null>(null);
+	// One SessionView serves every local session, so session-scoped UI state must
+	// reset on a switch. Reset during render, not in an effect: children must never
+	// mount (or fetch) against the previous session's reviewer, popout, or dialog.
+	const [stateSessionId, setStateSessionId] = useState(sessionId);
+	if (stateSessionId !== sessionId) {
+		setStateSessionId(sessionId);
+		setTerminalTarget({ kind: "worker" });
+		setReviewerChatId(null);
+		setBrowserPopOutState({ sessionId, phase: "docked" });
+		setFilesPoppedOut(false);
+		setHandoffDialogOpen(false);
+	}
 	const bindHandoffDialogContainer = useCallback((node: HTMLDivElement | null) => {
 		handoffDialogContainerRef.current = node;
 		setHandoffDialogContainer(node);
@@ -1300,6 +1317,7 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 	const browserView = useBrowserView({
 		sessionId: uiSessionId,
 		origin: hostId ? { hostId, sessionId, proxyBase: remoteBase ?? "" } : undefined,
+		cloudAgentBrowser: session?.cloud && cloudCpReady ? { baseUrl: cloudCpBaseUrl, orgId: session.cloud.orgId, sessionId: session.id } : undefined,
 		active: browserSlotVisible,
 		poppedOut: browserPoppedOut,
 		terminated: browserTerminated,
@@ -1349,16 +1367,8 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 		initializeInspectorSession(uiSessionId, hasBrowserContent, hasInspector);
 	}, [browserOnly, hasBrowserContent, hasInspector, session, uiSessionId, initializeInspectorSession, setInspectorOpenForSession, setInspectorViewForSession]);
 
-	useLayoutEffect(() => {
-		setTerminalTarget({ kind: "worker" });
-		setReviewerChatId(null);
-		setBrowserPopOutState({ sessionId, phase: "docked" });
-		setFilesPoppedOut(false);
-	}, [sessionId]);
-
-	// Route props change one render before the passive reset above. Reject the
-	// previous session's shell/reviewer synchronously so its handle can never be
-	// cached under the destination session.
+	// Keep rejecting another session's shell/reviewer handle here as well, so it
+	// can never be cached under the destination session.
 	const routedTerminalTarget = terminalTargetBelongsToSession(terminalTarget, sessionId)
 		? terminalTarget
 		: ({ kind: "worker" } satisfies TerminalTarget);
@@ -1998,6 +2008,7 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 									controllerResumeError={!hostId && autoResume.variables === sessionId && autoResume.isError
 										? apiErrorMessage(autoResume.error) : undefined}
 									controllerTransitioning={interfaceUi.controllerTransitioning}
+									accountMoving={Boolean(interfaceUi.accountMoveTarget)}
 									arriving={interfaceUi.optimisticTarget === "chat"}
 									agentResuming={quietResume}
 									newWorkDisabled={interfaceUi.newWorkDisabled}
@@ -2022,6 +2033,7 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 									hostId={hostId}
 									agentInputDisabled={interfaceUi.agentInputDisabled}
 									terminalBooting={interfaceUi.optimisticTarget === "tui"}
+									terminalSwitchingLabel={accountSwitchingLabel}
 									daemonReady={hostId ? Boolean(remoteBase) : daemonStatus.state === "ready"}
 									onCloseShellTerminal={closeShellTerminalByHandle}
 									onRenameShellTerminal={renameShellTerminalByHandle}

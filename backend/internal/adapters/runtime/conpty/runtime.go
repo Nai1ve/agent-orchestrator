@@ -14,6 +14,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/conpty/ptyregistry"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/procmem"
 )
 
 const (
@@ -102,6 +103,8 @@ type Runtime struct {
 	// processArgv reads a process's full argv to identify adopted hosts whose
 	// supervision was never recorded.
 	processArgv func(context.Context, int) ([]string, error)
+	// processTable reads every process, for RunningWorkloadCommands.
+	processTable func(context.Context) ([]procmem.Process, error)
 
 	mu       sync.Mutex
 	sessions map[string]*hostSession // sessionID -> live session
@@ -129,6 +132,7 @@ func New(opts Options) *Runtime {
 		destroyPoll:     25 * time.Millisecond,
 		managedChildren: snapshotManagedChildren,
 		processArgv:     processArgv,
+		processTable:    snapshotProcesses,
 		sessions:        make(map[string]*hostSession),
 	}
 }
